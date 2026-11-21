@@ -1,0 +1,50 @@
+# 泰拉终端（MaiPRTS）示例配置文件
+# 运行时请勿将本文件直接提交为 config.toml 到公开仓库
+
+[plugin]
+enabled = true
+config_version = "0.1.0"
+
+[scope]
+# 留空表示全会话生效；支持群 ID / 用户 ID，或带平台前缀如 qq:123456
+group_whitelist = []
+group_blacklist = []
+private_whitelist = []
+private_blacklist = []
+
+[context]
+# 开启后在检测到群聊/私聊出现方舟黑话或干员名时，向 Planner 注入极简语境参考（≤180字）
+enable_planner_hint = true
+# 命中方舟语境时向 Replyer 注入轻量口吻提醒（避免机械背百科）
+enable_replyer_style_hint = true
+# 命中高置信方舟词后，该会话保持“方舟讨论热态”的秒数（用于辅助放行多义词如“叔叔”“小羊”）
+hot_session_ttl_seconds = 300
+# 单轮最多注入多少条词条小抄
+max_hint_items = 6
+
+[commands]
+# 是否启用快捷斜杠指令 /方舟 与 /立绘
+enable_commands = true
+
+[prts]
+# PRTS MediaWiki API 地址（如使用自建合法镜像可自行修改）
+api_url = "https://prts.wiki/api.php"
+# 自定义礼貌 User-Agent（遵循 MediaWiki API 规范）
+user_agent = "MaiBot-ArknightsWiki/0.1.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)"
+# 单次网络请求超时（秒）
+timeout_seconds = 12.0
+# 两次请求 PRTS 之间的最小间隔（毫秒，建议 ≥ 500 以尊重社区服务器）
+min_request_interval_ms = 500
+# 请求立绘缩略图宽度（像素，1280 兼顾清晰度与聊天发送速度；0 表示原图）
+illustration_thumb_width = 1280
+
+[cache]
+# 页面 Wikitext 缓存过期时间（小时）
+page_ttl_hours = 168
+# 立绘本地 LRU 缓存上限（MB）
+image_cache_max_mb = 200
+
+[glossary]
+# 自定义追加别称，格式："外号=标准PRTS词条名|简短定位(可选)"
+# 例如：["大肥鱼=斯卡蒂|6★无畏者近卫"]
+custom_aliases = []

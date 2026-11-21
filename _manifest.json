@@ -1,0 +1,43 @@
+{
+  "manifest_version": 2,
+  "id": "feiyu.arknights-wiki",
+  "version": "0.1.0",
+  "name": "泰拉终端",
+  "description": "轻量级《明日方舟》PRTS Wiki 知识与立绘插件：微秒级黑话语境感知让麦麦听懂群友聊方舟，按需精准查询干员技能、模组、材料、档案与剧情，支持精二/皮肤高清立绘直发（纯代码 MIT，按需缓存，不污染记忆库）。",
+  "author": {
+    "name": "Allure-Gui",
+    "url": "https://github.com/Allure-Gui"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Allure-Gui/maibot-arknights-wiki",
+    "homepage": "https://github.com/Allure-Gui/maibot-arknights-wiki",
+    "documentation": "https://github.com/Allure-Gui/maibot-arknights-wiki/blob/main/README.md",
+    "issues": "https://github.com/Allure-Gui/maibot-arknights-wiki/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.4.99"
+  },
+  "sdk": {
+    "min_version": "2.13.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.27.0"
+    }
+  ],
+  "plugin_type": "data",
+  "capabilities": [
+    "config.get",
+    "send.text",
+    "send.image"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  }
+}

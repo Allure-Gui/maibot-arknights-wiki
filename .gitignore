@@ -1,0 +1,11 @@
+# 运行时配置与缓存严禁提交到版本控制
+config.toml
+__pycache__/
+*.py[cod]
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+cache/
+.DS_Store
+Thumbs.db
