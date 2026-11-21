@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 
 class WikiCacheStore:
@@ -26,11 +27,16 @@ class WikiCacheStore:
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as conn:
@@ -184,24 +190,29 @@ class WikiCacheStore:
         digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
         file_name = f"{digest}{safe_ext}"
         file_path = self.image_dir / file_name
-        tmp_path = self.image_dir / f"{file_name}.tmp"
-        tmp_path.write_bytes(data)
-        tmp_path.replace(file_path)
+        tmp_path = self.image_dir / f"{file_name}.{threading.get_ident()}.tmp"
 
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO images(cache_key, file_name, size_bytes, source_url, last_used_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    file_name = excluded.file_name,
-                    size_bytes = excluded.size_bytes,
-                    source_url = excluded.source_url,
-                    last_used_at = excluded.last_used_at
-                """,
-                (cache_key, file_name, len(data), source_url, time.time()),
-            )
-            self._evict_images_locked(conn)
+        with self._lock:
+            try:
+                tmp_path.write_bytes(data)
+                tmp_path.replace(file_path)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO images(cache_key, file_name, size_bytes, source_url, last_used_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        file_name = excluded.file_name,
+                        size_bytes = excluded.size_bytes,
+                        source_url = excluded.source_url,
+                        last_used_at = excluded.last_used_at
+                    """,
+                    (cache_key, file_name, len(data), source_url, time.time()),
+                )
+                self._evict_images_locked(conn)
         return file_path
 
     def _evict_images_locked(self, conn: sqlite3.Connection) -> None:
@@ -224,16 +235,57 @@ class WikiCacheStore:
             conn.execute("DELETE FROM images WHERE cache_key = ?", (cache_key,))
             total -= int(size_bytes or 0)
 
-    def clear_all(self) -> tuple[int, int]:
-        """清空全部文本与图片缓存，返回 (清除页面数, 清除图片数)。"""
+    def clear_all(self) -> tuple[int, int, float]:
+        """清空全部文本与图片缓存，返回 (清除页面数, 清除图片数, 释放MB数)。"""
         with self._lock, self._connect() as conn:
-            p_cnt = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-            i_cnt = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
-            conn.executescript("DELETE FROM pages; DELETE FROM redirects; DELETE FROM images; DELETE FROM image_lists;")
+            p_cnt = int(conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] or 0)
+            i_cnt = int(conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
+            b_sum = int(conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM images").fetchone()[0] or 0)
+            conn.executescript(
+                "DELETE FROM pages; DELETE FROM redirects; DELETE FROM images; DELETE FROM image_lists;"
+            )
         for fp in self.image_dir.glob("*"):
             try:
                 if fp.is_file():
+                    b_sum = max(b_sum, 0)
                     fp.unlink()
             except OSError:
                 pass
-        return int(p_cnt), int(i_cnt)
+        freed_mb = round(b_sum / (1024 * 1024), 2)
+        return p_cnt, i_cnt, freed_mb
+
+    def cleanup_expired(self, page_ttl_seconds: float) -> tuple[int, int]:
+        """自动清理过期页面缓存与丢失文件的孤儿图片索引。"""
+        now = time.time()
+        cutoff = now - max(3600.0, float(page_ttl_seconds))
+        removed_pages = 0
+        removed_imgs = 0
+        with self._lock, self._connect() as conn:
+            cur1 = conn.execute("DELETE FROM pages WHERE updated_at < ?", (cutoff,))
+            removed_pages += int(cur1.rowcount or 0)
+            conn.execute("DELETE FROM image_lists WHERE updated_at < ?", (cutoff,))
+            rows = conn.execute("SELECT cache_key, file_name FROM images").fetchall()
+            for cache_key, file_name in rows:
+                if not (self.image_dir / str(file_name)).is_file():
+                    conn.execute("DELETE FROM images WHERE cache_key = ?", (cache_key,))
+                    removed_imgs += 1
+            self._evict_images_locked(conn)
+            conn.execute("PRAGMA optimize")
+        return removed_pages, removed_imgs
+
+    def get_stats(self) -> dict[str, float | int]:
+        """获取当前本地缓存占用统计。"""
+        with self._lock, self._connect() as conn:
+            p_cnt = int(conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] or 0)
+            r_cnt = int(conn.execute("SELECT COUNT(*) FROM redirects").fetchone()[0] or 0)
+            i_cnt = int(conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
+            b_sum = int(conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM images").fetchone()[0] or 0)
+        db_kb = round(self.db_path.stat().st_size / 1024, 1) if self.db_path.is_file() else 0.0
+        img_mb = round(b_sum / (1024 * 1024), 2)
+        return {
+            "pages": p_cnt,
+            "redirects": r_cnt,
+            "images": i_cnt,
+            "image_mb": img_mb,
+            "db_kb": db_kb,
+        }

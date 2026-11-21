@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "feiyu.arknights-wiki",
-  "version": "0.1.0",
-  "name": "泰拉终端",
-  "description": "轻量级《明日方舟》PRTS Wiki 知识与立绘插件：微秒级黑话语境感知让麦麦听懂群友聊方舟，按需精准查询干员技能、模组、材料、档案与剧情，支持精二/皮肤高清立绘直发（纯代码 MIT，按需缓存，不污染记忆库）。",
+  "version": "0.2.0",
+  "name": "明日方舟wiki插件",
+  "description": "《明日方舟》PRTS Wiki 查询与立绘插件：支持方舟黑话语境感知（日常闲聊不误触）、干员技能/模组/材料/档案查询、2x 高清工业风卡片图渲染与精二/皮肤高清立绘直发（纯代码 MIT，按需本地缓存，不污染记忆库）。",
   "author": {
     "name": "Allure-Gui",
     "url": "https://github.com/Allure-Gui"
@@ -34,7 +34,8 @@
   "capabilities": [
     "config.get",
     "send.text",
-    "send.image"
+    "send.image",
+    "render.html2png"
   ],
   "i18n": {
     "default_locale": "zh-CN",

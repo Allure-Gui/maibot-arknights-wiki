@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
@@ -190,11 +192,16 @@ def clean_wiki_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
+def parse_materials_list(raw: str) -> list[tuple[str, str]]:
+    """从 {{材料消耗|名称|数量}} 序列中提取 [(材料名, 数量), ...]。"""
+    return [(n.strip(), c.strip()) for n, c in _RE_MATERIAL.findall(raw or "") if n.strip()]
+
+
 def format_materials_inline(raw: str) -> str:
     """把 {{材料消耗|名称|数量}} 序列格式化为“名称×数量、...”"""
-    items = _RE_MATERIAL.findall(raw or "")
+    items = parse_materials_list(raw)
     if items:
-        return "、".join(f"{name.strip()}×{cnt.strip()}" for name, cnt in items)
+        return "、".join(f"{name}×{cnt}" for name, cnt in items)
     return clean_wiki_text(raw)
 
 
@@ -237,11 +244,11 @@ class PRTSClient:
         matcher: ArknightsContextMatcher,
         *,
         api_url: str = "https://prts.wiki/api.php",
-        user_agent: str = "MaiBot-ArknightsWiki/0.1.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
+        user_agent: str = "MaiBot-ArknightsWiki/0.2.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
         timeout_seconds: float = 12.0,
         min_interval_ms: int = 500,
         page_ttl_hours: int = 168,
-        thumb_width: int = 1280,
+        thumb_width: int = 1600,
     ) -> None:
         self.store = store
         self.matcher = matcher
@@ -253,10 +260,22 @@ class PRTSClient:
         self.thumb_width = max(0, int(thumb_width))
 
         self._sem = asyncio.Semaphore(2)
+        self._cdn_sem = asyncio.Semaphore(6)
         self._rate_lock = asyncio.Lock()
         self._last_req_ts = 0.0
         self._cooldown_until = 0.0
         self._http: Optional[httpx.AsyncClient] = None
+
+        # L1 内存极速热缓存（零磁盘 IO、零重复解析）
+        self._mem_titles: dict[str, str] = {}
+        self._mem_structs: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._mem_uris: OrderedDict[str, str] = OrderedDict()
+
+    def clear_memory_cache(self) -> None:
+        """清空 L1 内存热缓存。"""
+        self._mem_titles.clear()
+        self._mem_structs.clear()
+        self._mem_uris.clear()
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -307,6 +326,10 @@ class PRTSClient:
         if not q:
             return None
 
+        q_key = q.lower()
+        if q_key in self._mem_titles:
+            return self._mem_titles[q_key]
+
         # 1. 本地别称词典
         local = self.matcher.resolve_alias_local(q)
         if local:
@@ -315,6 +338,7 @@ class PRTSClient:
         # 2. 本地 SQLite 重定向缓存
         cached_target = await asyncio.to_thread(self.store.get_redirect, q)
         if cached_target:
+            self._mem_titles[q_key] = cached_target
             return cached_target
 
         # 3. PRTS 官方 Redirect 精确查询（支持水陈/小羊/42等全社区外号）
@@ -323,6 +347,7 @@ class PRTSClient:
         for pid, pinfo in pages.items():
             if int(pid) > 0 and pinfo.get("title"):
                 canonical = str(pinfo["title"]).strip()
+                self._mem_titles[q_key] = canonical
                 await asyncio.to_thread(self.store.put_redirect, raw_query, canonical)
                 if q != raw_query:
                     await asyncio.to_thread(self.store.put_redirect, q, canonical)
@@ -336,6 +361,7 @@ class PRTSClient:
         # 优先排除“/语音记录”“/干员密录”等子页
         best = next((h["title"] for h in hits if "/" not in str(h.get("title", ""))), hits[0]["title"])
         best = str(best).strip()
+        self._mem_titles[q_key] = best
         await asyncio.to_thread(self.store.put_redirect, raw_query, best)
         return best
 
@@ -577,10 +603,15 @@ class PRTSClient:
     def _format_operator_materials(self, title: str, wikitext: str, detail: str = "") -> str:
         lines = [f"【{title} · 养成升级材料清单】"]
         focus = (detail or "").strip().lower()
+        focus_clean = focus.replace("精一", "").replace("精二", "").replace("精1", "").replace("精2", "")
+        has_elite_kw = any(k in focus for k in ("精", "elite"))
+        has_skill_kw = any(k in focus_clean for k in ("技", "专", "skill", "1", "2", "3", "一", "二", "三", "7", "七"))
+        has_mod_kw = any(k in focus for k in ("模组", "mod"))
+        show_all = not (has_elite_kw or has_skill_kw or has_mod_kw) or "全" in focus
 
         # 1. 精英化材料
         elite_tpls = extract_templates(wikitext, {"精英化材料"})
-        if elite_tpls and (not focus or any(k in focus for k in ("精", "elite", "全"))):
+        if elite_tpls and (show_all or has_elite_kw):
             ep = parse_template_params(elite_tpls[0][1])
             lines.append("▶ 精英化：")
             for k in ("精1", "精2"):
@@ -589,11 +620,11 @@ class PRTSClient:
 
         # 2. 技能升级与专精材料
         skill_mat_tpls = extract_templates(wikitext, {"技能升级材料"})
-        if skill_mat_tpls and (not focus or any(k in focus for k in ("技", "专", "skill", "全", "1", "2", "3", "一", "二", "三"))):
+        if skill_mat_tpls and (show_all or has_skill_kw):
             smp = parse_template_params(skill_mat_tpls[0][1])
             skill_names = [parse_template_params(inn).get("技能名", "") for _, inn in extract_templates(wikitext, {"技能"})]
 
-            if not focus or any(k in focus for k in ("7", "七", "通用", "技", "全")):
+            if show_all or any(k in focus_clean for k in ("7", "七", "通用")):
                 base_parts = [f"Lv{lv}:{format_materials_inline(smp[str(lv)])}" for lv in range(2, 8) if smp.get(str(lv))]
                 if base_parts:
                     lines.append("▶ 技能通用 2→7 级：")
@@ -601,8 +632,9 @@ class PRTSClient:
                         lines.append(f"  {bp}")
 
             cn_nums = (("一", 1), ("二", 2), ("三", 3))
+            specific_idx = [num for cn, num in cn_nums if cn in focus_clean or str(num) in focus_clean]
             for cn, num in cn_nums:
-                if focus and not any(k in focus for k in (cn, str(num), "专", "全", "技")):
+                if specific_idx and num not in specific_idx:
                     continue
                 sname = f"({skill_names[num - 1]})" if num - 1 < len(skill_names) and skill_names[num - 1] else ""
                 m_parts = []
@@ -626,7 +658,7 @@ class PRTSClient:
             parts = [f"Lv{lv}({format_materials_inline(mp[k])})" for lv, k in ((1, "材料消耗"), (2, "材料消耗2"), (3, "材料消耗3")) if mp.get(k)]
             if parts:
                 mod_lines.append(f"  {mname}{f'[{mtype}]' if mtype else ''}：" + " | ".join(parts))
-        if mod_lines and (not focus or any(k in focus for k in ("模组", "mod", "全"))):
+        if mod_lines and (show_all or has_mod_kw):
             lines.append("▶ 专属模组：")
             lines.extend(mod_lines)
 
@@ -824,7 +856,7 @@ class PRTSClient:
                 available_variants=avail,
             )
 
-        # 请求 MediaWiki imageinfo 获取官方缩略图 URL
+        # 请求 MediaWiki imageinfo 获取高质量缩略图或原图 URL
         q_params: dict[str, Any] = {
             "action": "query",
             "titles": f"File:{fname}",
@@ -837,7 +869,13 @@ class PRTSClient:
         img_url = ""
         for pinfo in info_res.get("query", {}).get("pages", {}).values():
             ii = (pinfo.get("imageinfo") or [{}])[0]
-            img_url = str(ii.get("thumburl") or ii.get("url") or "")
+            orig_w = int(ii.get("width") or 0)
+            orig_size = int(ii.get("size") or 0)
+            # 若原图尺寸本就不大（宽度 <= 目标宽，或体积 <= 3.5MB 且用户设高画质），优先取无损原图避免二次重采样发糊
+            if self.thumb_width == 0 or (orig_w and orig_w <= self.thumb_width) or (self.thumb_width >= 1600 and 0 < orig_size <= 3_500_000):
+                img_url = str(ii.get("url") or ii.get("thumburl") or "")
+            else:
+                img_url = str(ii.get("thumburl") or ii.get("url") or "")
             if img_url:
                 break
         if not img_url:
@@ -865,3 +903,267 @@ class PRTSClient:
             source_url=img_url,
             available_variants=avail,
         )
+
+    # ---- 结构化干员数据提取 & 批量图标 Data URI 获取（供高质量卡片渲染） ----
+
+    async def get_operator_struct(self, target: str) -> Optional[dict[str, Any]]:
+        """解析干员完整结构化数据（带 L1 内存热缓存），非干员或未找到时返回 None。"""
+        title = await self.resolve_title(target)
+        if not title:
+            return None
+        now = time.time()
+        mem_hit = self._mem_structs.get(title)
+        if mem_hit and (now - mem_hit[0]) < self.page_ttl_seconds:
+            self._mem_structs.move_to_end(title)
+            return mem_hit[1]
+        fetched = await self.fetch_wikitext(title)
+        if not fetched:
+            return None
+        wikitext, is_operator = fetched
+        if not is_operator:
+            return None
+        parsed = self._parse_operator_struct(title, wikitext)
+        self._mem_structs[title] = (now, parsed)
+        if len(self._mem_structs) > 64:
+            self._mem_structs.popitem(last=False)
+        return parsed
+
+    def _parse_operator_struct(self, title: str, wikitext: str) -> dict[str, Any]:
+        tpls = extract_templates(wikitext, {"CharinfoV2", "干员信息"})
+        info = parse_template_params(tpls[0][1]) if tpls else {}
+
+        rarity_raw = info.get("稀有度", "").strip()
+        stars = (int(rarity_raw) + 1) if rarity_raw.isdigit() else 6
+        org = " / ".join(
+            x for x in (info.get("所属国家", ""), info.get("所属组织", ""), info.get("所属团队", "")) if x
+        )
+
+        # 白值
+        stats: dict[str, str] = {}
+        attr_tpls = extract_templates(wikitext, {"属性"})
+        if attr_tpls:
+            ap = parse_template_params(attr_tpls[0][1])
+            stats = {
+                "hp": ap.get("精英2_满级_生命上限") or ap.get("精英1_满级_生命上限") or ap.get("精英0_满级_生命上限", "-"),
+                "atk": ap.get("精英2_满级_攻击") or ap.get("精英1_满级_攻击") or ap.get("精英0_满级_攻击", "-"),
+                "def": ap.get("精英2_满级_防御") or ap.get("精英1_满级_防御") or ap.get("精英0_满级_防御", "-"),
+                "res": ap.get("精英2_满级_法术抗性") or ap.get("精英1_满级_法术抗性") or ap.get("精英0_满级_法术抗性", "0"),
+                "cost": ap.get("部署费用", "-"),
+                "block": ap.get("阻挡数", "-"),
+                "speed": ap.get("攻击速度", "-"),
+                "redeploy": ap.get("再部署", "-"),
+            }
+
+        # 天赋
+        talents: list[dict[str, str]] = []
+        for _, inner in extract_templates(wikitext, {"天赋列表3", "天赋列表2", "天赋列表"}):
+            tp = parse_template_params(inner)
+            best_name, best_eff, best_cond = "", "", ""
+            for idx in range(1, 8):
+                eff = tp.get(f"天赋{idx}效果", "").strip()
+                cond = tp.get(f"天赋{idx}条件", "").strip()
+                name = tp.get(f"天赋{idx}", "").strip()
+                if eff and "潜能" not in cond:
+                    best_name = name or best_name
+                    best_eff = eff
+                    best_cond = cond
+            if best_eff:
+                talents.append({"name": best_name, "cond": best_cond, "effect": clean_wiki_text(best_eff)})
+
+        # 技能
+        skills: list[dict[str, str]] = []
+        lv_candidates = [
+            ("专精3", "专三"), ("专精2", "专二"), ("专精1", "专一"),
+            ("10", "专三"), ("9", "专二"), ("8", "专一"), ("7", "Lv.7"), ("1", "Lv.1"),
+        ]
+        for idx, (_, inner) in enumerate(extract_templates(wikitext, {"技能"}), 1):
+            sp = parse_template_params(inner)
+            top_key, lv_label = "", ""
+            for key_pfx, lbl in lv_candidates:
+                if sp.get(f"技能{key_pfx}描述"):
+                    top_key, lv_label = key_pfx, lbl
+                    break
+            skills.append(
+                {
+                    "index": str(idx),
+                    "name": sp.get("技能名", f"技能{idx}"),
+                    "recovery": sp.get("技能类型1", ""),
+                    "trigger": sp.get("技能类型2", ""),
+                    "level": lv_label,
+                    "init_sp": sp.get(f"技能{top_key}初始", "") if top_key else "",
+                    "cost_sp": sp.get(f"技能{top_key}消耗", "") if top_key else "",
+                    "duration": sp.get(f"技能{top_key}持续", "") if top_key else "",
+                    "desc": clean_wiki_text(sp.get(f"技能{top_key}描述", "")) if top_key else "",
+                }
+            )
+
+        # 精英化材料
+        elite_mats: list[dict[str, Any]] = []
+        elite_tpls = extract_templates(wikitext, {"精英化材料"})
+        if elite_tpls:
+            ep = parse_template_params(elite_tpls[0][1])
+            for k in ("精1", "精2"):
+                items = parse_materials_list(ep.get(k, ""))
+                if items:
+                    elite_mats.append({"stage": k, "items": items})
+
+        # 技能专精材料（以及 2-7 通用材料）
+        skill_base_mats: list[dict[str, Any]] = []
+        skill_mastery_mats: list[dict[str, Any]] = []
+        skill_mat_tpls = extract_templates(wikitext, {"技能升级材料"})
+        if skill_mat_tpls:
+            smp = parse_template_params(skill_mat_tpls[0][1])
+            for lv in range(2, 8):
+                items = parse_materials_list(smp.get(str(lv), ""))
+                if items:
+                    skill_base_mats.append({"stage": f"Lv.{lv}", "items": items})
+            for cn, num in (("一", 1), ("二", 2), ("三", 3)):
+                sname = skills[num - 1]["name"] if num - 1 < len(skills) else f"技能{num}"
+                stages = []
+                for lv, lbl in ((8, "专一"), (9, "专二"), (10, "专三")):
+                    items = parse_materials_list(smp.get(f"{cn}{lv}", ""))
+                    if items:
+                        stages.append({"stage": lbl, "items": items})
+                if stages:
+                    skill_mastery_mats.append({"index": num, "name": sname, "stages": stages})
+
+        # 专属模组
+        modules: list[dict[str, Any]] = []
+        stat_keys = ("生命", "攻击", "防御", "法术抗性", "攻击速度", "部署费用", "再部署", "阻挡数")
+        for _, inner in extract_templates(wikitext, {"模组"}):
+            mp = parse_template_params(inner)
+            if mp.get("基础证章", "").lower() in ("yes", "1", "true") or mp.get("类型图标") == "original":
+                continue
+            lv3_stats = []
+            for sk in stat_keys:
+                val = mp.get(f"{sk}3") or mp.get(f"{sk}2") or mp.get(sk)
+                if val:
+                    lv3_stats.append(f"{sk}+{val}")
+            stages = []
+            for lv, key in ((1, "材料消耗"), (2, "材料消耗2"), (3, "材料消耗3")):
+                items = parse_materials_list(mp.get(key, ""))
+                if items:
+                    stages.append({"stage": f"Lv.{lv}", "items": items})
+            tasks = [clean_wiki_text(mp.get(f"任务{i}", "")) for i in (1, 2) if mp.get(f"任务{i}")]
+            modules.append(
+                {
+                    "name": clean_wiki_text(mp.get("名称", "专属模组")),
+                    "type": mp.get("类型", mp.get("类型图标", "")),
+                    "stats": lv3_stats,
+                    "trait": clean_wiki_text(mp.get("特性", "")),
+                    "talent2": clean_wiki_text(mp.get("天赋2", "")).replace("\n", " "),
+                    "talent3": clean_wiki_text(mp.get("天赋3", "")).replace("\n", " "),
+                    "tasks": tasks,
+                    "stages": stages,
+                }
+            )
+
+        return {
+            "name": title,
+            "en_name": info.get("干员外文名", ""),
+            "stars": stars,
+            "profession": info.get("职业", ""),
+            "sub_profession": info.get("分支", ""),
+            "position": info.get("位置", ""),
+            "org": org,
+            "trait": clean_wiki_text(info.get("特性", "")),
+            "stats": stats,
+            "talents": talents,
+            "skills": skills,
+            "elite_mats": elite_mats,
+            "skill_base_mats": skill_base_mats,
+            "skill_mastery_mats": skill_mastery_mats,
+            "modules": modules,
+            "skins": extract_skin_map(wikitext),
+        }
+
+    async def fetch_file_data_uris(self, file_names: list[str], *, thumb_width: int = 160) -> dict[str, str]:
+        """批量极速获取 PRTS 小图标/头像/半身像并转为离线 data:image/png;base64 URI（L1内存 + L2磁盘双级缓存）。"""
+        unique_names = list(dict.fromkeys(f.strip() for f in file_names if f and f.strip()))
+        if not unique_names:
+            return {}
+
+        result: dict[str, str] = {}
+        missing: list[str] = []
+        for fn in unique_names:
+            cache_key = f"icon:{fn}@{thumb_width}"
+            mem_uri = self._mem_uris.get(cache_key)
+            if mem_uri:
+                self._mem_uris.move_to_end(cache_key)
+                result[fn] = mem_uri
+                continue
+            cached = await asyncio.to_thread(self.store.get_image_bytes, cache_key)
+            if cached:
+                uri = "data:image/png;base64," + base64.b64encode(cached).decode("ascii")
+                self._mem_uris[cache_key] = uri
+                if len(self._mem_uris) > 256:
+                    self._mem_uris.popitem(last=False)
+                result[fn] = uri
+            else:
+                missing.append(fn)
+
+        if not missing:
+            return result
+
+        # 每批最多 30 个文件，1 次 MediaWiki API 批量查 URL（极大降低对 PRTS 服务器压力）
+        url_map: dict[str, str] = {}
+        for start in range(0, len(missing), 30):
+            chunk = missing[start : start + 30]
+            titles_str = "|".join(f"File:{fn}" for fn in chunk)
+            try:
+                q_params: dict[str, Any] = {
+                    "action": "query",
+                    "titles": titles_str,
+                    "prop": "imageinfo",
+                    "iiprop": "url|size",
+                }
+                if thumb_width > 0:
+                    q_params["iiurlwidth"] = thumb_width
+                info = await self._api(q_params)
+            except Exception:
+                continue
+
+            # 建立规范化标题回查表（MediaWiki 会把下划线转为空格、去掉 File:/文件: 前缀）
+            norm_lookup = {fn.replace("_", " ").lower(): fn for fn in chunk}
+            for pid, pinfo in info.get("query", {}).get("pages", {}).items():
+                if int(pid) <= 0:
+                    continue
+                ptitle = str(pinfo.get("title") or "")
+                bare = ptitle.split(":", 1)[1] if ":" in ptitle else ptitle
+                orig_fn = norm_lookup.get(bare.replace("_", " ").lower())
+                if not orig_fn:
+                    continue
+                ii = (pinfo.get("imageinfo") or [{}])[0]
+                img_url = str(ii.get("thumburl") or ii.get("url") or "")
+                if img_url:
+                    url_map[orig_fn] = img_url
+
+        # 从 media.prts.wiki 静态 CDN 受控并发拉取小图标（6 并发，约 200ms 完成）
+        async def _download_one(fn: str, url: str) -> None:
+            if time.monotonic() < self._cooldown_until:
+                return
+            try:
+                async with self._cdn_sem:
+                    resp = await self._client().get(url)
+                    if resp.status_code in (429, 503):
+                        self._cooldown_until = time.monotonic() + 30.0
+                        return
+                    resp.raise_for_status()
+                    raw = resp.content
+                if not raw:
+                    return
+                cache_key = f"icon:{fn}@{thumb_width}"
+                await asyncio.to_thread(self.store.put_image_bytes, cache_key, raw, url, ".png")
+                ct = resp.headers.get("content-type", "").lower()
+                mime = "image/webp" if "webp" in ct else ("image/jpeg" if "jpeg" in ct else "image/png")
+                uri = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+                self._mem_uris[cache_key] = uri
+                if len(self._mem_uris) > 256:
+                    self._mem_uris.popitem(last=False)
+                result[fn] = uri
+            except Exception:
+                return
+
+        if url_map:
+            await asyncio.gather(*(_download_one(fn, u) for fn, u in url_map.items()))
+        return result
