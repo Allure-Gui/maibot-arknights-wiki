@@ -162,11 +162,11 @@ class WikiCacheStore:
                 (operator_name, files_json, time.time()),
             )
 
-    def get_image_bytes(self, cache_key: str) -> Optional[bytes]:
-        """读取本地缓存的立绘图片字节，并更新 LRU 访问时间。"""
+    def get_image(self, cache_key: str) -> Optional[tuple[bytes, str]]:
+        """读取本地立绘字节与图源，并更新 LRU 访问时间。"""
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT file_name FROM images WHERE cache_key = ?",
+                "SELECT file_name, source_url FROM images WHERE cache_key = ?",
                 (cache_key,),
             ).fetchone()
             if not row:
@@ -180,9 +180,35 @@ class WikiCacheStore:
                 (time.time(), cache_key),
             )
         try:
-            return file_path.read_bytes()
+            return file_path.read_bytes(), str(row[1])
         except OSError:
             return None
+
+    def get_image_bytes_many(self, cache_keys: list[str]) -> dict[str, bytes]:
+        """批量读取本地缓存图片：单次连接、单次事务，并一次性刷新 LRU 访问时间。"""
+        if not cache_keys:
+            return {}
+        out: dict[str, bytes] = {}
+        hit: list[str] = []
+        stale: list[str] = []
+        marks = ','.join('?' * len(cache_keys))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f'SELECT cache_key, file_name FROM images WHERE cache_key IN ({marks})',
+                list(cache_keys),
+            ).fetchall()
+            for key, file_name in rows:
+                try:
+                    out[str(key)] = (self.image_dir / str(file_name)).read_bytes()
+                    hit.append(str(key))
+                except OSError:
+                    stale.append(str(key))
+            if hit:
+                now = time.time()
+                conn.executemany('UPDATE images SET last_used_at = ? WHERE cache_key = ?', [(now, k) for k in hit])
+            if stale:
+                conn.executemany('DELETE FROM images WHERE cache_key = ?', [(k,) for k in stale])
+        return out
 
     def put_image_bytes(self, cache_key: str, data: bytes, source_url: str, ext: str = ".png") -> Path:
         """保存立绘字节到本地磁盘，并在超限时执行 LRU 淘汰。"""
@@ -244,13 +270,13 @@ class WikiCacheStore:
             conn.executescript(
                 "DELETE FROM pages; DELETE FROM redirects; DELETE FROM images; DELETE FROM image_lists;"
             )
-        for fp in self.image_dir.glob("*"):
-            try:
-                if fp.is_file():
-                    b_sum = max(b_sum, 0)
-                    fp.unlink()
-            except OSError:
-                pass
+            # 与 put_image_bytes 使用同一把锁，清理不会删掉新写入的图片。
+            for fp in self.image_dir.glob("*"):
+                try:
+                    if fp.is_file():
+                        fp.unlink()
+                except OSError:
+                    pass
         freed_mb = round(b_sum / (1024 * 1024), 2)
         return p_cnt, i_cnt, freed_mb
 

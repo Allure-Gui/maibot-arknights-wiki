@@ -16,6 +16,54 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 _ASCII_WORD_RE = re.compile(r"^[a-z0-9_]+$")
+_CUSTOM_ALIAS_SPLIT_RE = re.compile(r"\s*[=＝:：]\s*|\s+")
+
+
+def parse_custom_alias_line(line: str) -> tuple[str, str, str] | None:
+    """宽容解析自定义黑话行，支持 `外号=干员名|定位`、`外号:干员名`、`外号 干员名` 等常见写法。"""
+    s = str(line or "").strip()
+    if not s or s.startswith("#"):
+        return None
+    if any(sep in s for sep in ("=", "＝", ":", "：")):
+        parts = re.split(r"[=＝:：]", s, maxsplit=1)
+        alias = parts[0].strip()
+        rhs = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        parts = s.split(None, 1)
+        if len(parts) < 2:
+            return None
+        alias, rhs = parts[0].strip(), parts[1].strip()
+    if not alias or not rhs:
+        return None
+    if "|" in rhs or "｜" in rhs:
+        target, brief = [p.strip() for p in re.split(r"[|｜]", rhs, maxsplit=1)]
+    else:
+        target, brief = rhs.strip(), "自定义别称"
+    if not target:
+        return None
+    return alias, target, brief or "自定义别称"
+
+
+def load_runtime_aliases(path: Path) -> list[str]:
+    """从插件数据目录读取运行时热维护的自定义别称列表。"""
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def save_runtime_aliases(path: Path, aliases: Sequence[str]) -> None:
+    """将运行时自定义别称列表持久化到插件数据目录。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean = [str(x).strip() for x in aliases if str(x).strip()]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +84,10 @@ class ArknightsContextMatcher:
         glossary_path: Path,
         custom_aliases: Sequence[str] | None = None,
         hot_ttl_seconds: float = 300.0,
+        custom_alias_force_tier1: bool = True,
     ) -> None:
         self.hot_ttl_seconds = max(30.0, float(hot_ttl_seconds))
+        self.custom_alias_force_tier1 = bool(custom_alias_force_tier1)
         self._hot_sessions: dict[str, float] = {}
         self._context_words: list[str] = []
         self._tier1: list[tuple[str, str, str, bool]] = []
@@ -49,14 +99,29 @@ class ArknightsContextMatcher:
         raw = json.loads(glossary_path.read_text(encoding="utf-8"))
         self._context_words = [str(w).strip().lower() for w in raw.get("context_words", []) if str(w).strip()]
 
+        # 先解析用户自定义别称，允许覆盖内置词典同名外号
+        custom_parsed: list[tuple[str, str, str, bool]] = []
+        custom_keys: set[str] = set()
+        for line in custom_aliases:
+            parsed = parse_custom_alias_line(line)
+            if not parsed:
+                continue
+            alias, target, brief = parsed
+            key_lower = alias.lower()
+            is_ascii = bool(_ASCII_WORD_RE.fullmatch(key_lower))
+            custom_parsed.append((alias, target, brief, is_ascii))
+            custom_keys.add(key_lower)
+
         def add_entries(mapping: dict[str, list[str]], bucket: list[tuple[str, str, str, bool]]) -> None:
             for k, v in mapping.items():
                 term = str(k).strip()
                 if not term or not isinstance(v, list) or not v:
                     continue
+                key_lower = term.lower()
+                if key_lower in custom_keys:
+                    continue
                 target = str(v[0]).strip()
                 brief = str(v[1]).strip() if len(v) > 1 else ""
-                key_lower = term.lower()
                 is_ascii = bool(_ASCII_WORD_RE.fullmatch(key_lower))
                 bucket.append((term, target, brief, is_ascii))
                 self._alias_lookup[key_lower] = (target, brief)
@@ -64,23 +129,12 @@ class ArknightsContextMatcher:
         add_entries(raw.get("tier1", {}), self._tier1)
         add_entries(raw.get("tier2", {}), self._tier2)
 
-        # 加载用户自定义追加别称："外号=标准词条|简短定位"
-        for line in custom_aliases:
-            s = str(line or "").strip()
-            if "=" not in s:
-                continue
-            alias_part, rhs = s.split("=", 1)
-            alias = alias_part.strip()
-            if not alias or not rhs.strip():
-                continue
-            if "|" in rhs:
-                target, brief = [p.strip() for p in rhs.split("|", 1)]
-            else:
-                target, brief = rhs.strip(), "用户自定义别称"
+        for alias, target, brief, is_ascii in custom_parsed:
             key_lower = alias.lower()
-            is_ascii = bool(_ASCII_WORD_RE.fullmatch(key_lower))
-            # 长度 >= 2 的中文或 >= 3 的英文放 Tier1，否则放 Tier2 防误触
-            bucket = self._tier1 if (not is_ascii and len(alias) >= 2) or (is_ascii and len(alias) >= 3) else self._tier2
+            if self.custom_alias_force_tier1:
+                bucket = self._tier1
+            else:
+                bucket = self._tier1 if (not is_ascii and len(alias) >= 2) or (is_ascii and len(alias) >= 3) else self._tier2
             bucket.append((alias, target, brief, is_ascii))
             self._alias_lookup[key_lower] = (target, brief)
 

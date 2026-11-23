@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "feiyu.arknights-wiki",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "name": "明日方舟wiki插件",
-  "description": "《明日方舟》PRTS Wiki 查询与立绘插件：支持方舟黑话语境感知（日常闲聊不误触）、干员技能/模组/材料/档案查询、2x 高清工业风卡片图渲染与精二/皮肤高清立绘直发（纯代码 MIT，按需本地缓存，不污染记忆库）。",
+  "description": "《明日方舟》PRTS Wiki 查询与工具插件：支持方舟黑话语境感知与自定义外号、干员技能/模组/材料/总账/语音/当期活动/公招保底计算、2x 黑曜石金箔风格卡片与帮助图渲染、高清立绘直发，支持多平台与黑白名单（纯代码 MIT，按需本地缓存）。",
   "author": {
     "name": "Allure-Gui",
     "url": "https://github.com/Allure-Gui"
@@ -33,6 +33,7 @@
   "plugin_type": "data",
   "capabilities": [
     "config.get",
+    "chat.get_all_streams",
     "send.text",
     "send.image",
     "render.html2png"
@@ -40,5 +41,13 @@
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": ["zh-CN"]
+  },
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.png",
+      "fallback": "book-open",
+      "background": "#171B24"
+    }
   }
 }

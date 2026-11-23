@@ -33,7 +33,8 @@ _RE_HTML_TAG = re.compile(
     re.I,
 )
 _RE_MAGIC_WORD = re.compile(r"__(?:TOC|NOTOC|FORCETOC|NOEDITSECTION|INDEX|NOINDEX)__", re.I)
-_RE_WIKILINK = re.compile(r"\[\[(?:[^|\]]+\|)?([^\]]+)\]\]")
+_RE_FILE_LINK = re.compile(r"\[\[\s*(?:文件|File|Image|图像|Media)\s*:[^\]]*\]\]", re.I)
+_RE_WIKILINK = re.compile(r"\[\[(?:[^|\]]*\|)*([^|\]]+)\]\]")
 _RE_EXTLINK = re.compile(r"\[https?://\S+\s+([^\]]+)\]")
 _RE_MATERIAL = re.compile(r"\{\{材料消耗\|([^|{}]+)\|([^|{}]+)(?:\|[^{}]*)?\}\}")
 _RE_INLINE_TPL = re.compile(
@@ -43,6 +44,11 @@ _RE_INLINE_TPL = re.compile(
 _RE_OTHER_TPL = re.compile(r"\{\{[^{}]*\}\}")
 _RE_SECTION_HDR = re.compile(r"^==\s*([^=\n]+?)\s*==\s*$", re.M)
 _RE_SKIN_NAME = re.compile(r"^时装(\d+)名称$")
+# <references group=注/> 这类自闭合引用容器不在通用标签白名单里，需单独剥离
+_RE_REFERENCES = re.compile(r"<references\b[^>]*?/\s*>|<references\b[^>]*>.*?</references>", re.S | re.I)
+_RE_TABLE_CELL_SPLIT = re.compile(r"\|\||!!|\||!")
+# 分类标签属于元数据，正文里不该出现「分类:集成战略关卡」
+_RE_CATEGORY_LINE = re.compile(r"^[ \t]*分类[:：].*$", re.M)
 
 
 @dataclass(slots=True)
@@ -57,6 +63,10 @@ class IllustrationResult:
     source_url: str = ""
     available_variants: list[str] | None = None
     error: str = ""
+
+
+# PRTS 干员页的技能模板名不统一：1/2 技能常为 {{技能2，3 技能为 {{技能，需一并匹配（按页面顺序即技能序号）
+SKILL_TPL_NAMES = {"技能", "技能2", "技能3"}
 
 
 def extract_templates(wikitext: str, template_names: set[str]) -> list[tuple[str, str]]:
@@ -162,12 +172,51 @@ def parse_template_params(inner: str) -> dict[str, str]:
     return params
 
 
+_RE_TITLE_NOISE = re.compile(r"[\s()（）·・\-—–_/]")
+
+
+def _norm_title(text: str) -> str:
+    """归一化标题：去掉空格、括号、连接符等排版噪音，用于判断两个标题是否同形。"""
+    return _RE_TITLE_NOISE.sub("", str(text or "").lower())
+
+
+def _strip_tables(text: str) -> str:
+    """把 Wikitext 表格语法压成单行可读文本，避免 `{|class="wikitable"` 之类残留成乱码。"""
+    if "{|" not in text and not text.lstrip().startswith(("|", "!")):
+        return text
+    out: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            out.append(raw_line)
+            continue
+        if line.startswith("{|") or line.startswith("|}") or line.startswith("|-") or line.startswith("|+"):
+            continue
+        if line.startswith("分类:") or line.startswith("分类："):
+            continue
+        if line.startswith("|") or line.startswith("!"):
+            cells = []
+            for cell in _RE_TABLE_CELL_SPLIT.split(line[1:]):
+                c = cell.strip()
+                # 单元格可能带 "style=xxx|内容" 属性，取最后一段
+                if "|" in c:
+                    c = c.split("|")[-1].strip()
+                if c:
+                    cells.append(c)
+            if cells:
+                out.append(" ｜ ".join(cells))
+            continue
+        out.append(raw_line)
+    return "\n".join(out)
+
+
 def clean_wiki_text(text: str) -> str:
     """将常见 PRTS Wikitext 标记清洗为紧凑可读纯文本。"""
     if not text:
         return ""
     s = _RE_HTML_COMMENT.sub("", text)
     s = _RE_REF_TAG.sub("", s)
+    s = _RE_REFERENCES.sub("", s)
     s = _RE_BR_TAG.sub("\n", s)
     s = _RE_MATERIAL.sub(lambda m: f"{m.group(1).strip()}×{m.group(2).strip()}", s)
     # 多轮展开常见内联格式模板
@@ -176,8 +225,10 @@ def clean_wiki_text(text: str) -> str:
         if ns == s:
             break
         s = ns
+    s = _RE_FILE_LINK.sub("", s)
     s = _RE_WIKILINK.sub(r"\1", s)
     s = _RE_EXTLINK.sub(r"\1", s)
+    s = _RE_CATEGORY_LINE.sub("", s)
     s = _RE_HTML_TAG.sub("", s)
     s = _RE_MAGIC_WORD.sub("", s)
     # 清理残余简单模板
@@ -187,6 +238,9 @@ def clean_wiki_text(text: str) -> str:
             break
         s = ns
     s = s.replace("'''", "").replace("''", "")
+    # 各级标题压成「· 标题」，避免 ==xxx== / ===xxx=== 残留
+    s = re.sub(r"^={2,}\s*(.+?)\s*={2,}\s*$", r"· \1", s, flags=re.M)
+    s = _strip_tables(s)
     lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in s.splitlines()]
     out = "\n".join(ln for ln in lines if ln)
     return re.sub(r"\n{3,}", "\n\n", out).strip()
@@ -244,7 +298,7 @@ class PRTSClient:
         matcher: ArknightsContextMatcher,
         *,
         api_url: str = "https://prts.wiki/api.php",
-        user_agent: str = "MaiBot-ArknightsWiki/0.2.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
+        user_agent: str = "MaiBot-ArknightsWiki/0.3.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
         timeout_seconds: float = 12.0,
         min_interval_ms: int = 500,
         page_ttl_hours: int = 168,
@@ -253,7 +307,7 @@ class PRTSClient:
         self.store = store
         self.matcher = matcher
         self.api_url = api_url.strip() or "https://prts.wiki/api.php"
-        self.user_agent = user_agent.strip() or "MaiBot-ArknightsWiki/0.1.0"
+        self.user_agent = user_agent.strip() or "MaiBot-ArknightsWiki/0.3.0"
         self.timeout_seconds = max(3.0, float(timeout_seconds))
         self.min_interval = max(0.3, float(min_interval_ms) / 1000.0)
         self.page_ttl_seconds = max(3600.0, float(page_ttl_hours) * 3600.0)
@@ -270,12 +324,15 @@ class PRTSClient:
         self._mem_titles: dict[str, str] = {}
         self._mem_structs: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._mem_uris: OrderedDict[str, str] = OrderedDict()
+        # 图标负缓存：PRTS 上不存在的文件名 -> 记录时间，避免每次出卡都重复查询
+        self._mem_miss: dict[str, float] = {}
 
     def clear_memory_cache(self) -> None:
         """清空 L1 内存热缓存。"""
         self._mem_titles.clear()
         self._mem_structs.clear()
         self._mem_uris.clear()
+        self._mem_miss.clear()
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -300,10 +357,23 @@ class PRTSClient:
 
         async with self._sem:
             async with self._rate_lock:
-                elapsed = time.monotonic() - self._last_req_ts
+                # Recheck after waiting for a slot: another in-flight request may have opened cooldown.
+                now = time.monotonic()
+                if now < self._cooldown_until:
+                    wait_sec = int(self._cooldown_until - now) + 1
+                    raise RuntimeError(
+                        f"PRTS 接口正在限流冷却中（剩余约 {wait_sec} 秒），已跳过请求以保护社区服务器。"
+                    )
+                elapsed = now - self._last_req_ts
                 if elapsed < self.min_interval:
                     await asyncio.sleep(self.min_interval - elapsed)
-                self._last_req_ts = time.monotonic()
+                now = time.monotonic()
+                if now < self._cooldown_until:
+                    wait_sec = int(self._cooldown_until - now) + 1
+                    raise RuntimeError(
+                        f"PRTS 接口正在限流冷却中（剩余约 {wait_sec} 秒），已跳过请求以保护社区服务器。"
+                    )
+                self._last_req_ts = now
 
             resp = await self._client().get(url, params=params)
             if resp.status_code in (429, 503):
@@ -311,7 +381,7 @@ class PRTSClient:
                 raw_ra = resp.headers.get("Retry-After", "").strip()
                 if raw_ra.isdigit():
                     retry_after = min(300.0, max(15.0, float(raw_ra)))
-                self._cooldown_until = time.monotonic() + retry_after
+                self._cooldown_until = max(self._cooldown_until, time.monotonic() + retry_after)
                 raise RuntimeError(f"PRTS 返回 HTTP {resp.status_code}，已自动退避冷却 {int(retry_after)} 秒。")
             resp.raise_for_status()
             return resp
@@ -353,16 +423,41 @@ class PRTSClient:
                     await asyncio.to_thread(self.store.put_redirect, q, canonical)
                 return canonical
 
-        # 4. 模糊搜索兜底
-        sr = await self._api({"action": "query", "list": "search", "srsearch": q, "srlimit": 5})
-        hits = sr.get("query", {}).get("search", [])
-        if not hits:
+        # 4. 模糊搜索兜底：只接受与查询词高度相关的标题。
+        #    旧逻辑直接取搜索第一名，会把「龙门」解析成关卡页「UO-2 初涉龙门」、
+        #    「乌萨斯」落到「乌萨斯社团壁纸」，而且还会写进 14 天的 redirect 缓存长期粘住。
+        sr = await self._api({"action": "query", "list": "search", "srsearch": q, "srlimit": 8})
+        q_norm = q.strip().lower()
+        cands: list[tuple[int, int, str]] = []
+        for h in sr.get("query", {}).get("search", []):
+            t = str(h.get("title") or "").strip()
+            if not t or "/" in t:  # 排除「/语音记录」「/干员密录」等子页
+                continue
+            tl = t.lower()
+            if tl == q_norm:
+                rank = 0
+            elif len(tl) >= 2 and q_norm.startswith(tl):
+                # 查询词里包含完整标题，如「陈sir」→「陈」
+                rank = 1
+            elif tl.startswith(q_norm) and len(tl) - len(q_norm) <= 2:
+                # 标题仅在查询词尾部多一两个字，且去掉括号空格后同形（如「阿米娅近卫」→「阿米娅(近卫)」）
+                if _norm_title(tl) == _norm_title(q_norm):
+                    rank = 2
+                else:
+                    continue
+            else:
+                continue
+            cands.append((rank, len(t), t))
+        if not cands:
             return None
-        # 优先排除“/语音记录”“/干员密录”等子页
-        best = next((h["title"] for h in hits if "/" not in str(h.get("title", ""))), hits[0]["title"])
-        best = str(best).strip()
+        cands.sort()
+        best = cands[0][2]
         self._mem_titles[q_key] = best
-        await asyncio.to_thread(self.store.put_redirect, raw_query, best)
+        if cands[0][0] == 0:
+            # 只有精确命中才落 14 天 redirect 缓存；模糊命中留给下次重新判定，避免脏映射长期粘住
+            await asyncio.to_thread(self.store.put_redirect, raw_query, best)
+            if q != raw_query:
+                await asyncio.to_thread(self.store.put_redirect, q, best)
         return best
 
     async def fetch_wikitext(self, title: str, *, force_refresh: bool = False) -> Optional[tuple[str, bool]]:
@@ -402,8 +497,29 @@ class PRTSClient:
 
     async def query_wiki(self, target: str, section: str = "overview", detail: str = "") -> str:
         """统一对外查询入口：返回紧凑、LLM 友好的结构化摘要。"""
+        sec = (section or "overview").strip().lower()
+        if sec in ("events", "event", "活动", "卡池", "寻访"):
+            return await self.query_current_events()
+        if sec in ("voice", "voices", "语音", "台词"):
+            return await self.query_voice_lines(target, keyword=detail)
+        if sec in ("summary", "total", "总计", "汇总", "总账"):
+            return await self.query_material_summary(target, detail=detail)
+
         title = await self.resolve_title(target)
         if not title:
+            # 名字本身是词典里的方舟阵营/概念词（罗德岛、卡兹戴尔等），只是 PRTS 没有独立页面，
+            # 此时提示「请检查名称」会误导人，改为说明原因并给出替代查法。
+            local = self.matcher.resolve_alias_local(target)
+            if str(target).strip() in ("明日方舟", "方舟", "舟游", "arknights"):
+                return (
+                    "「明日方舟」是游戏本体，PRTS Wiki 按干员/关卡/道具组织内容，没有「游戏本体」这一词条。"
+                    "想查什么直接给干员名就好，例如 /方舟 阿米娅。"
+                )
+            if local:
+                return (
+                    f"「{target}」是《明日方舟》的阵营/概念类词条（{local[1]}），"
+                    "PRTS Wiki 上没有独立页面，查不到正文。可以改查具体干员，例如 /方舟 阿米娅。"
+                )
             return f"未在 PRTS Wiki 找到与「{target}」匹配的词条，请检查名称或换个关键词。"
 
         fetched = await self.fetch_wikitext(title)
@@ -411,7 +527,6 @@ class PRTSClient:
             return f"找到了词条「{title}」，但暂未获取到正文内容。"
 
         wikitext, is_operator = fetched
-        sec = (section or "overview").strip().lower()
         page_url = f"https://prts.wiki/w/{quote(title)}"
 
         if not is_operator or sec == "wiki":
@@ -429,6 +544,11 @@ class PRTSClient:
         else:
             body = self._format_operator_overview(title, wikitext)
 
+        if not str(body or "").strip():
+            body = (
+                f"【PRTS 词条：{title}】该页面只有数据模板/表格，暂无可读正文。"
+                "可以改用 /方舟 <干员名> 查干员资料，或直接打开 PRTS 原页查看。"
+            )
         return f"{body}\n\n来源：PRTS Wiki ({page_url}) [CC BY-NC-SA 4.0]"
 
     # ---- 以下为各视图精准排版器（严格控制输出长度防撑爆上下文） ----
@@ -491,7 +611,7 @@ class PRTSClient:
                     lines.append(f"- {best_name}({best_cond})：{clean_wiki_text(best_eff)}")
 
         # 技能名速览
-        skill_tpls = extract_templates(wikitext, {"技能"})
+        skill_tpls = extract_templates(wikitext, SKILL_TPL_NAMES)
         if skill_tpls:
             s_names = [parse_template_params(inn).get("技能名", "").strip() for _, inn in skill_tpls]
             s_names = [f"{i + 1}.{n}" for i, n in enumerate(s_names) if n]
@@ -506,7 +626,7 @@ class PRTSClient:
         return "\n".join(lines)
 
     def _format_operator_skills(self, title: str, wikitext: str) -> str:
-        skill_tpls = extract_templates(wikitext, {"技能"})
+        skill_tpls = extract_templates(wikitext, SKILL_TPL_NAMES)
         if not skill_tpls:
             return f"未在「{title}」页面解析到技能数据。"
 
@@ -613,8 +733,16 @@ class PRTSClient:
         elite_tpls = extract_templates(wikitext, {"精英化材料"})
         if elite_tpls and (show_all or has_elite_kw):
             ep = parse_template_params(elite_tpls[0][1])
+            # 明确说了「精一」或「精二」就只给对应阶段，别把两段都糊上去
+            elite_stages = ("精1", "精2")
+            only_e1 = ("精一" in focus or "精1" in focus) and not ("精二" in focus or "精2" in focus)
+            only_e2 = ("精二" in focus or "精2" in focus) and not ("精一" in focus or "精1" in focus)
+            if only_e1 and not only_e2:
+                elite_stages = ("精1",)
+            elif only_e2 and not only_e1:
+                elite_stages = ("精2",)
             lines.append("▶ 精英化：")
-            for k in ("精1", "精2"):
+            for k in elite_stages:
                 if ep.get(k):
                     lines.append(f"  {k}：{format_materials_inline(ep[k])}")
 
@@ -622,7 +750,7 @@ class PRTSClient:
         skill_mat_tpls = extract_templates(wikitext, {"技能升级材料"})
         if skill_mat_tpls and (show_all or has_skill_kw):
             smp = parse_template_params(skill_mat_tpls[0][1])
-            skill_names = [parse_template_params(inn).get("技能名", "") for _, inn in extract_templates(wikitext, {"技能"})]
+            skill_names = [parse_template_params(inn).get("技能名", "") for _, inn in extract_templates(wikitext, SKILL_TPL_NAMES)]
 
             if show_all or any(k in focus_clean for k in ("7", "七", "通用")):
                 base_parts = [f"Lv{lv}:{format_materials_inline(smp[str(lv)])}" for lv in range(2, 8) if smp.get(str(lv))]
@@ -751,6 +879,13 @@ class PRTSClient:
             chosen = "\n".join(x for x in [lead[:400], *rest_parts] if x)
         if not chosen:
             chosen = clean_wiki_text(wikitext)
+        if not str(chosen).strip():
+            # 正文全是模板/表格，已被清洗掉：交给上层给出可操作的提示，而不是甩一个空标题
+            return ""
+        # 只剩小标题、没有任何正文（典型是纯数据表的关卡页），同样视为无内容
+        body_lines = [ln.strip() for ln in str(chosen).splitlines() if ln.strip()]
+        if body_lines and all(ln.startswith("· ") for ln in body_lines):
+            return ""
         if len(chosen) > 900:
             chosen = chosen[:900].rstrip() + "……"
         return f"【PRTS 词条：{title}】\n{chosen}"
@@ -793,18 +928,36 @@ class PRTSClient:
                 tag, label = "e2", "精二立绘"
             elif stem.startswith("skin"):
                 tag = stem
+                num = stem[4:]
                 sname = skin_map.get(stem, "")
-                label = f"皮肤「{sname}」({stem})" if sname else f"皮肤({stem})"
+                label = f"皮肤{num}「{sname}」" if sname else f"皮肤{num}"
             else:
-                tag, label = stem, f"立绘({stem})"
+                # 「立绘_X_1+.png」「立绘_X_2b.png」这类是剧情/差分立绘，别混进基础立绘列表
+                tag, label = f"alt{stem}", f"差分立绘（{stem}）"
             items.append({"file_name": fname, "tag": tag, "label": label, "skin_name": skin_map.get(stem, "")})
 
         if items:
             await asyncio.to_thread(self.store.put_image_list, operator_name, json.dumps(items, ensure_ascii=False))
         return items
 
+    @staticmethod
+    def _format_variant_cn(it: dict[str, str]) -> str:
+        """将立绘条目格式化为纯中文展示文本（兼容旧缓存数据）。"""
+        tag = str(it.get("tag") or "").strip().lower()
+        sname = str(it.get("skin_name") or "").strip()
+        if tag == "e0":
+            return "初始（初始立绘）"
+        if tag == "e2":
+            return "精二（精二立绘）"
+        if tag.startswith("skin"):
+            num = tag[4:]
+            return f"皮肤{num}：「{sname}」" if sname else f"皮肤{num}"
+        if tag.startswith("alt"):
+            return str(it.get("label") or f"差分立绘（{tag[3:]}）")
+        return str(it.get("label") or tag)
+
     async def fetch_illustration(self, operator_query: str, variant: str = "e2") -> IllustrationResult:
-        """按干员名/别称与变体（e2/e0/skin1/皮肤名/list）获取立绘缩图字节。"""
+        """按干员名/别称与变体（精二/初始/皮肤1/皮肤名/列表）获取立绘缩图字节。"""
         op_name = await self.resolve_title(operator_query)
         if not op_name:
             return IllustrationResult(ok=False, operator=operator_query, error=f"未找到干员「{operator_query}」。")
@@ -813,21 +966,23 @@ class PRTSClient:
         if not items:
             return IllustrationResult(ok=False, operator=op_name, error=f"未在 PRTS 找到「{op_name}」的立绘文件。")
 
-        avail = [f"{it['tag']}: {it['label']}" for it in items]
+        avail = [self._format_variant_cn(it) for it in items]
         v = (variant or "e2").strip().lower()
         if v in ("list", "列表", "全部", "皮肤列表"):
             return IllustrationResult(ok=True, operator=op_name, available_variants=avail, label="列表")
 
         chosen: Optional[dict[str, str]] = None
+        # 兜底时只从「初始/精二」里挑，避免把剧情差分立绘当成主立绘发出去
+        base = [it for it in items if it["tag"] in ("e0", "e2")] or items
         if v in ("e2", "精二", "精2", "2", "默认", ""):
             chosen = next((it for it in items if it["tag"] == "e2"), None) or next(
-                (it for it in items if it["tag"] == "e0"), items[0]
+                (it for it in items if it["tag"] == "e0"), base[0]
             )
         elif v in ("e0", "e1", "初始", "原皮", "精0", "精1", "1"):
-            chosen = next((it for it in items if it["tag"] == "e0"), items[0])
+            chosen = next((it for it in items if it["tag"] == "e0"), base[0])
         elif v in ("skin", "皮肤", "时装", "最新皮肤"):
             skins = [it for it in items if it["tag"].startswith("skin")]
-            chosen = skins[-1] if skins else items[-1]
+            chosen = skins[-1] if skins else base[-1]
         else:
             # 精确或模糊匹配 tag（skin1/皮肤1）或皮肤中文名（如“超新星”）
             norm_v = v.replace("皮肤", "skin").replace("时装", "skin")
@@ -845,14 +1000,16 @@ class PRTSClient:
 
         fname = chosen["file_name"]
         cache_key = f"{fname}@{self.thumb_width}"
-        cached_bytes = await asyncio.to_thread(self.store.get_image_bytes, cache_key)
-        if cached_bytes:
+        cached = await asyncio.to_thread(self.store.get_image, cache_key)
+        if cached and cached[0]:
+            cached_bytes, source_url = cached
             return IllustrationResult(
                 ok=True,
                 operator=op_name,
                 label=chosen["label"],
                 file_name=fname,
                 image_bytes=cached_bytes,
+                source_url=source_url,
                 available_variants=avail,
             )
 
@@ -976,7 +1133,7 @@ class PRTSClient:
             ("专精3", "专三"), ("专精2", "专二"), ("专精1", "专一"),
             ("10", "专三"), ("9", "专二"), ("8", "专一"), ("7", "Lv.7"), ("1", "Lv.1"),
         ]
-        for idx, (_, inner) in enumerate(extract_templates(wikitext, {"技能"}), 1):
+        for idx, (_, inner) in enumerate(extract_templates(wikitext, SKILL_TPL_NAMES), 1):
             sp = parse_template_params(inner)
             top_key, lv_label = "", ""
             for key_pfx, lbl in lv_candidates:
@@ -1077,36 +1234,44 @@ class PRTSClient:
             "skins": extract_skin_map(wikitext),
         }
 
-    async def fetch_file_data_uris(self, file_names: list[str], *, thumb_width: int = 160) -> dict[str, str]:
+    async def fetch_file_data_uris(self, file_names: list[str], *, thumb_width: int = 160) -> tuple[dict[str, str], bool]:
         """批量极速获取 PRTS 小图标/头像/半身像并转为离线 data:image/png;base64 URI（L1内存 + L2磁盘双级缓存）。"""
         unique_names = list(dict.fromkeys(f.strip() for f in file_names if f and f.strip()))
         if not unique_names:
-            return {}
+            return {}, True
 
         result: dict[str, str] = {}
         missing: list[str] = []
+        pending: dict[str, str] = {}
+        now_m = time.monotonic()
         for fn in unique_names:
             cache_key = f"icon:{fn}@{thumb_width}"
             mem_uri = self._mem_uris.get(cache_key)
             if mem_uri:
                 self._mem_uris.move_to_end(cache_key)
                 result[fn] = mem_uri
-                continue
-            cached = await asyncio.to_thread(self.store.get_image_bytes, cache_key)
-            if cached:
-                uri = "data:image/png;base64," + base64.b64encode(cached).decode("ascii")
-                self._mem_uris[cache_key] = uri
-                if len(self._mem_uris) > 256:
-                    self._mem_uris.popitem(last=False)
-                result[fn] = uri
+            elif now_m - self._mem_miss.get(cache_key, -1e9) < 21600.0:
+                continue  # 负缓存：6 小时内已确认 PRTS 无此文件，直接跳过
             else:
-                missing.append(fn)
+                self._mem_miss.pop(cache_key, None)
+                pending[cache_key] = fn
+        if pending:
+            # 一次线程、一次 SQLite 连接读完全部磁盘缓存
+            disk = await asyncio.to_thread(self.store.get_image_bytes_many, list(pending))
+            for cache_key, fn in pending.items():
+                raw = disk.get(cache_key)
+                if raw:
+                    result[fn] = self._mem_uris[cache_key] = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+                else:
+                    missing.append(fn)
+            while len(self._mem_uris) > 256:
+                self._mem_uris.popitem(last=False)
 
         if not missing:
-            return result
+            return result, True
 
-        # 每批最多 30 个文件，1 次 MediaWiki API 批量查 URL（极大降低对 PRTS 服务器压力）
         url_map: dict[str, str] = {}
+        confirmed_missing: set[str] = set()
         for start in range(0, len(missing), 30):
             chunk = missing[start : start + 30]
             titles_str = "|".join(f"File:{fn}" for fn in chunk)
@@ -1123,30 +1288,50 @@ class PRTSClient:
             except Exception:
                 continue
 
-            # 建立规范化标题回查表（MediaWiki 会把下划线转为空格、去掉 File:/文件: 前缀）
+            # API errors and malformed responses are transient/unknown; never negative-cache them.
+            if not isinstance(info, dict) or "error" in info or not isinstance(info.get("query"), dict):
+                continue
+
             norm_lookup = {fn.replace("_", " ").lower(): fn for fn in chunk}
-            for pid, pinfo in info.get("query", {}).get("pages", {}).items():
-                if int(pid) <= 0:
+            pages = info["query"].get("pages")
+            if not isinstance(pages, dict):
+                continue
+            for pid, pinfo in pages.items():
+                if not isinstance(pinfo, dict):
                     continue
                 ptitle = str(pinfo.get("title") or "")
                 bare = ptitle.split(":", 1)[1] if ":" in ptitle else ptitle
                 orig_fn = norm_lookup.get(bare.replace("_", " ").lower())
                 if not orig_fn:
                     continue
-                ii = (pinfo.get("imageinfo") or [{}])[0]
+                # MediaWiki marks a definitively absent file with the `missing` property.
+                if "missing" in pinfo:
+                    confirmed_missing.add(orig_fn)
+                    continue
+                ii_list = pinfo.get("imageinfo")
+                if not isinstance(ii_list, list) or not ii_list or not isinstance(ii_list[0], dict):
+                    continue
+                ii = ii_list[0]
                 img_url = str(ii.get("thumburl") or ii.get("url") or "")
                 if img_url:
                     url_map[orig_fn] = img_url
 
+        # Negative-cache only explicit MediaWiki missing markers, never absent URLs or API errors.
+        miss_now = time.monotonic()
+        for fn in confirmed_missing:
+            self._mem_miss[f"icon:{fn}@{thumb_width}"] = miss_now
+        if len(self._mem_miss) > 512:
+            self._mem_miss = {k: t for k, t in self._mem_miss.items() if miss_now - t < 21600.0}
+
         # 从 media.prts.wiki 静态 CDN 受控并发拉取小图标（6 并发，约 200ms 完成）
         async def _download_one(fn: str, url: str) -> None:
-            if time.monotonic() < self._cooldown_until:
-                return
             try:
                 async with self._cdn_sem:
+                    if time.monotonic() < self._cooldown_until:
+                        return
                     resp = await self._client().get(url)
                     if resp.status_code in (429, 503):
-                        self._cooldown_until = time.monotonic() + 30.0
+                        self._cooldown_until = max(self._cooldown_until, time.monotonic() + 30.0)
                         return
                     resp.raise_for_status()
                     raw = resp.content
@@ -1166,4 +1351,399 @@ class PRTSClient:
 
         if url_map:
             await asyncio.gather(*(_download_one(fn, u) for fn, u in url_map.items()))
-        return result
+        # 只按本次请求实际取得的图片或明确缺失的文件判断。
+        return result, all(fn in result or fn in confirmed_missing for fn in missing)
+
+    # --------------------------------------------------------
+    # 轻量化扩展能力：材料总账汇总 / 语音台词 / 当期活动 / 公招计算
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _parse_mat_qty(raw: str) -> int:
+        s = str(raw or "").strip().lower().replace(",", "").replace("，", "")
+        if not s:
+            return 0
+        mult = 1
+        if s.endswith("w") or s.endswith("万"):
+            mult = 10000
+            s = s[:-1]
+        elif s.endswith("k") or s.endswith("千"):
+            mult = 1000
+            s = s[:-1]
+        m = re.search(r"[\d.]+", s)
+        if not m:
+            return 0
+        try:
+            return int(round(float(m.group(0)) * mult))
+        except ValueError:
+            return 0
+
+    async def query_material_summary(self, target: str, detail: str = "") -> str:
+        """一键汇总干员养成材料总账（支持按 精二 / 1~7级 / 一二三技能专三 / 模组 自由组合）。"""
+        op = await self.get_operator_struct(target)
+        if not op:
+            return f"未找到干员「{target}」的养成材料数据。"
+
+        focus = (detail or "").strip().lower()
+        has_elite = any(k in focus for k in ("精一", "精二", "精1", "精2", "精英"))
+        has_base = any(k in focus for k in ("7级", "七级", "基础", "技能7"))
+        has_skill_specific = any(k in focus for k in ("专精", "专三", "专一", "专二", "一技能", "二技能", "三技能", "1技能", "2技能", "3技能"))
+        has_skill = has_skill_specific or ("技能" in focus and not has_base)
+        has_mod = any(k in focus for k in ("模组", "mod"))
+        default_all = not (has_elite or has_base or has_skill or has_mod) or "全" in focus
+
+        totals: dict[str, int] = {}
+        included: list[str] = []
+
+        def _add_items(items: list[tuple[str, str]]) -> None:
+            for name, qty_s in items:
+                n = clean_wiki_text(name).strip()
+                q = self._parse_mat_qty(qty_s)
+                if n and q > 0:
+                    totals[n] = totals.get(n, 0) + q
+
+        if default_all or has_elite:
+            only_e1 = ("精一" in focus or "精1" in focus) and not ("精二" in focus or "精2" in focus)
+            only_e2 = ("精二" in focus or "精2" in focus) and not ("精一" in focus or "精1" in focus)
+            for st in op.get("elite_mats") or []:
+                if only_e1 and st["stage"] != "精1":
+                    continue
+                if only_e2 and st["stage"] != "精2":
+                    continue
+                _add_items(st["items"])
+                included.append(st["stage"])
+
+        if has_base:
+            for st in op.get("skill_base_mats") or []:
+                _add_items(st["items"])
+            if op.get("skill_base_mats"):
+                included.append("技能Lv.2~7")
+
+        if default_all or has_skill:
+            focus_clean = re.sub(r"精[一二12]|模组[123一二三]?|专[一二三123]", "", focus)
+            spec_idx = [num for cn, num in (("一", 1), ("二", 2), ("三", 3)) if cn in focus_clean or str(num) in focus_clean]
+            for g in op.get("skill_mastery_mats") or []:
+                if spec_idx and g["index"] not in spec_idx:
+                    continue
+                for st in g.get("stages") or []:
+                    _add_items(st["items"])
+                included.append(f"{g['index']}技能专三")
+
+        if default_all or has_mod:
+            mods = op.get("modules") or []
+            # 若未指定多个模组且处于默认全量模式，默认只汇总第 1 个常用模组避免重复叠加
+            target_mods = mods[:1] if (default_all and len(mods) > 1 and "全模组" not in focus) else mods
+            for m in target_mods:
+                for st in m.get("stages") or []:
+                    _add_items(st["items"])
+                if m.get("stages"):
+                    mtype = f"({m['type']})" if m.get("type") else ""
+                    included.append(f"模组{mtype}Lv.1~3")
+
+        if not totals:
+            return f"未找到「{op['name']}」对应范围的材料数据。"
+
+        # 龙门币置顶，其余按数量降序排列
+        lmb = totals.pop("龙门币", 0)
+        sorted_items = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines = [
+            f"【{op['name']} · 养成材料总账】",
+            f"统计范围：{' + '.join(included)}",
+        ]
+        if lmb:
+            lmb_str = f"{lmb / 10000:.1f}万" if lmb >= 10000 else str(lmb)
+            lines.append(f"• 龙门币：{lmb_str}（{lmb:,}）")
+        chunks = [f"{name}×{cnt}" for name, cnt in sorted_items]
+        lines.append("• 素材合计：" + "、".join(chunks))
+        lines.append("（提示：可指定范围，如 /方舟 总计 维什戴尔 精二 三技能 模组）")
+        return "\n".join(lines)
+
+    async def query_voice_lines(self, target: str, keyword: str = "") -> str:
+        """查询干员中文语音台词彩蛋（仅缓存纯文本，不下载音频）。"""
+        title = await self.resolve_title(target)
+        if not title:
+            return f"未找到干员「{target}」。"
+        voice_page = f"{title}/语音记录"
+        fetched = await self.fetch_wikitext(voice_page)
+        if not fetched:
+            return f"未在 PRTS 找到「{title}」的语音记录。"
+        wikitext, _ = fetched
+
+        # 提取 |标题N=... 与对应 |台词N={{VoiceData/word|中文|...}}
+        titles_map: dict[str, str] = {}
+        for m in re.finditer(r"\|\s*标题(\d+)\s*=\s*([^\n|]+)", wikitext):
+            titles_map[m.group(1)] = clean_wiki_text(m.group(2)).strip()
+
+        entries: list[tuple[str, str]] = []
+        for m in re.finditer(r"\|\s*台词(\d+)\s*=([\s\S]*?)(?=\n\|\s*(?:标题|台词)\d+\s*=|\n\}\}|$)", wikitext):
+            idx = m.group(1)
+            block = m.group(2)
+            cn_m = re.search(r"\{\{\s*VoiceData/word\s*\|\s*中文\s*\|\s*([\s\S]*?)\}\}", block)
+            if not cn_m:
+                continue
+            line_txt = clean_wiki_text(cn_m.group(1)).replace("\n", " ").strip()
+            if not line_txt:
+                continue
+            label = titles_map.get(idx, f"语音{idx}")
+            entries.append((label, line_txt))
+
+        if not entries:
+            return f"暂未解析到「{title}」的中文台词。"
+
+        kw = (keyword or "").strip().lower()
+        kw_alias = {
+            "戳一戳": "戳一下",
+            "摸头": "信赖触摸",
+            "触摸": "信赖触摸",
+            "助理": "任命助理",
+            "上线": "问候",
+            "抽卡": "干员报到",
+            "报到": "干员报到",
+        }
+        kw_eff = kw_alias.get(kw, kw)
+        if kw in ("随机", "random", "来一句"):
+            import random
+            lbl, txt = random.choice(entries)
+            return f"【{title} · {lbl}】\n「{txt}」"
+
+        if kw_eff:
+            matched = [(lbl, txt) for lbl, txt in entries if kw_eff in lbl.lower() or kw_eff in txt.lower()]
+            if not matched:
+                sample_labels = "、".join(lbl for lbl, _ in entries[:10])
+                return f"未在「{title}」台词中找到「{keyword}」。常见分类：{sample_labels}"
+            picked = matched[:3]
+        else:
+            # 默认挑 3 条高互动经典台词
+            prefer = ("戳一下", "信赖触摸", "问候", "交谈1", "信赖提升后交谈1", "任命助理", "标题")
+            picked = []
+            for pf in prefer:
+                for item in entries:
+                    if pf in item[0] and item not in picked:
+                        picked.append(item)
+                        break
+                if len(picked) >= 3:
+                    break
+            if not picked:
+                picked = entries[:3]
+
+        out = [f"【{title} · 语音台词】"]
+        for lbl, txt in picked:
+            out.append(f"• {lbl}：「{txt}」")
+        return "\n".join(out)
+
+    async def query_current_events(self) -> str:
+        """通过 PRTS Semantic MediaWiki ask 接口速查国服当前活动与寻访卡池（6 小时缓存）。"""
+        import datetime
+
+        cache_title = "__prts_current_events_v1__"
+        cached = await asyncio.to_thread(self.store.get_page, cache_title, 6 * 3600.0)
+        if cached:
+            return cached[0]
+
+        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
+        now_dt = datetime.datetime.now(tz_cn)
+        now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        now_ts = int(now_dt.timestamp())
+
+        q_events = (
+            f"[[分类:有活动信息的页面]][[活动结束时间::>{now_iso}]]"
+            "|?名称缩短|?活动开始时间|?活动结束时间|sort=活动开始时间|order=desc|limit=10"
+        )
+        q_gacha = (
+            f"[[分类:国服寻访]][[寻访关闭时间cn::>{now_iso}]]"
+            "|?寻访名cn|?卡池名|?寻访开启时间cn|?寻访关闭时间cn|sort=寻访开启时间cn|order=desc|limit=8"
+        )
+
+        ev_res, ga_res = await asyncio.gather(
+            self._api({"action": "ask", "query": q_events}),
+            self._api({"action": "ask", "query": q_gacha}),
+            return_exceptions=True,
+        )
+
+        def _fmt_remain(start_ts: int, end_ts: int) -> str:
+            if start_ts > now_ts:
+                diff = start_ts - now_ts
+                d, h = divmod(diff // 3600, 24)
+                return f"{d}天{h}小时后开启" if d else f"{h}小时后开启"
+            diff = max(0, end_ts - now_ts)
+            d, h = divmod(diff // 3600, 24)
+            if d > 180:
+                return "长期常驻"
+            return f"剩余{d}天{h}小时" if d else f"剩余{h}小时"
+
+        def _extract_ts(arr: Any) -> int:
+            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                try:
+                    return int(arr[0].get("timestamp") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return 0
+
+        lines = [f"【明日方舟国服 · 当期活动与卡池】（{now_dt.strftime('%m-%d %H:%M')}）"]
+
+        ev_items: list[str] = []
+        if isinstance(ev_res, dict):
+            results = ev_res.get("query", {}).get("results") or {}
+            if isinstance(results, dict):
+                for title, obj in results.items():
+                    po = obj.get("printouts") or {}
+                    name = (po.get("名称缩短") or [title])[0]
+                    st_ts = _extract_ts(po.get("活动开始时间"))
+                    ed_ts = _extract_ts(po.get("活动结束时间"))
+                    if st_ts and st_ts - now_ts > 14 * 86400:
+                        continue
+                    ev_items.append(f"• {name}（{_fmt_remain(st_ts, ed_ts)}）")
+        if ev_items:
+            lines.append("▸ 活动：")
+            lines.extend(ev_items[:6])
+
+        ga_items: list[str] = []
+        if isinstance(ga_res, dict):
+            results = ga_res.get("query", {}).get("results") or {}
+            if isinstance(results, dict):
+                for title, obj in results.items():
+                    po = obj.get("printouts") or {}
+                    name = (po.get("寻访名cn") or [title])[0]
+                    st_ts = _extract_ts(po.get("寻访开启时间cn"))
+                    ed_ts = _extract_ts(po.get("寻访关闭时间cn"))
+                    if st_ts and st_ts - now_ts > 14 * 86400:
+                        continue
+                    ga_items.append(f"• {name}（{_fmt_remain(st_ts, ed_ts)}）")
+        if ga_items:
+            lines.append("▸ 寻访卡池：")
+            lines.extend(ga_items[:5])
+
+        if not ev_items and not ga_items:
+            return "暂未从 PRTS 获取到当期活动信息，请稍后再试。"
+
+        lines.append("来源：PRTS Wiki (CC BY-NC-SA 4.0)")
+        text = "\n".join(lines)
+        await asyncio.to_thread(self.store.put_page, cache_title, text, False)
+        return text
+
+    async def _get_recruit_pool(self) -> list[dict[str, Any]]:
+        """按需从 PRTS 干员一览拉取最新公开招募干员池并缓存 7 天（仅约 15 KB JSON）。"""
+        cache_title = "__prts_recruit_pool_v1__"
+        cached = await asyncio.to_thread(self.store.get_page, cache_title, self.page_ttl_seconds)
+        if cached:
+            try:
+                data = json.loads(cached[0])
+                if isinstance(data, list) and data:
+                    return data
+            except Exception:
+                pass
+
+        resp = await self._api({"action": "parse", "page": "干员一览", "prop": "text"})
+        html_text = str(resp.get("parse", {}).get("text", {}).get("*") or resp.get("parse", {}).get("text") or "")
+        if not html_text:
+            return []
+
+        pool: list[dict[str, Any]] = []
+        # 每个干员是一个带 data-zh / data-profession / data-rarity / data-position / data-tag / data-obtain-method 的 div
+        for m in re.finditer(r"<div\s+([^>]*data-zh=[^>]*)>", html_text):
+            attrs = m.group(1)
+            om = re.search(r'data-obtain-method="([^"]*)"', attrs)
+            if not om or "公开招募" not in om.group(1):
+                continue
+            zh_m = re.search(r'data-zh="([^"]+)"', attrs)
+            rar_m = re.search(r'data-rarity="(\d+)"', attrs)
+            prof_m = re.search(r'data-profession="([^"]+)"', attrs)
+            pos_m = re.search(r'data-position="([^"]+)"', attrs)
+            tag_m = re.search(r'data-tag="([^"]*)"', attrs)
+            if not (zh_m and rar_m):
+                continue
+            rarity = int(rar_m.group(1)) + 1
+            tags: set[str] = set()
+            if prof_m:
+                tags.add(prof_m.group(1).strip() + "干员")
+            if pos_m:
+                tags.add(pos_m.group(1).strip())
+            if tag_m:
+                for t in tag_m.group(1).split():
+                    t = t.strip()
+                    if t:
+                        tags.add(t)
+            if rarity == 6:
+                tags.add("高级资深干员")
+            elif rarity == 5:
+                tags.add("资深干员")
+            elif rarity == 1:
+                tags.add("支援机械")
+            pool.append({"name": zh_m.group(1).strip(), "rarity": rarity, "tags": sorted(tags)})
+
+        if pool:
+            await asyncio.to_thread(self.store.put_page, cache_title, json.dumps(pool, ensure_ascii=False), False)
+        return pool
+
+    async def calculate_recruit(self, raw_tags: list[str]) -> str:
+        """毫秒级公开招募 Tag 保底组合计算器（支持常见简写）。"""
+        from itertools import combinations
+
+        tag_alias = {
+            "高资": "高级资深干员", "高级资深": "高级资深干员",
+            "资深": "资深干员",
+            "机械": "支援机械", "小车": "支援机械",
+            "高台": "远程位", "远程": "远程位",
+            "地面": "近战位", "近战": "近战位",
+            "狙击": "狙击干员", "术师": "术师干员", "近卫": "近卫干员",
+            "先锋": "先锋干员", "重装": "重装干员", "医疗": "医疗干员",
+            "辅助": "辅助干员", "特种": "特种干员",
+            "回费": "费用回复", "快活": "快速复活", "群攻": "群攻",
+            "防护": "防护", "生存": "生存", "治疗": "治疗", "支援": "支援",
+            "新手": "新手", "输出": "输出", "减速": "减速", "控场": "控场",
+            "削弱": "削弱", "爆发": "爆发", "召唤": "召唤", "位移": "位移",
+            "元素": "元素",
+        }
+        norm_tags: list[str] = []
+        for t in raw_tags:
+            s = str(t or "").strip()
+            if not s:
+                continue
+            mapped = tag_alias.get(s, s)
+            if mapped not in norm_tags:
+                norm_tags.append(mapped)
+        if not norm_tags:
+            return "请提供公招词条，例：/公招 资深 狙击 削弱 爆发 生存"
+        norm_tags = norm_tags[:6]
+
+        pool = await self._get_recruit_pool()
+        if not pool:
+            return "暂未能拉取 PRTS 公招池数据，请稍后再试。"
+
+        combos: list[tuple[int, int, tuple[str, ...], list[dict[str, Any]]]] = []
+        for r in range(1, min(4, len(norm_tags)) + 1):
+            for comb in combinations(norm_tags, r):
+                has_top = "高级资深干员" in comb
+                matched = [
+                    op for op in pool
+                    if (op["rarity"] != 6 or has_top) and all(tg in op["tags"] for tg in comb)
+                ]
+                if not matched:
+                    continue
+                # 计算保底最低星级（1★ 支援机械在 9 小时招募会被排除，除非带支援机械词条）
+                non_1 = [op["rarity"] for op in matched if op["rarity"] >= 2]
+                if "支援机械" in comb:
+                    min_r = 1
+                    score = 45  # 1★ 必出小车高亮
+                elif not non_1:
+                    min_r = 1
+                    score = 45
+                else:
+                    min_r = min(non_1)
+                    score = min_r * 10
+                if min_r >= 4 or "支援机械" in comb:
+                    matched_sorted = sorted(matched, key=lambda x: (-x["rarity"], x["name"]))
+                    combos.append((score, min_r, comb, matched_sorted))
+
+        if not combos:
+            return f"词条「{' / '.join(norm_tags)}」未找到必出 4★ 及以上或支援机械的保底组合（可按需刷新）。"
+
+        combos.sort(key=lambda x: (-x[0], len(x[2]), len(x[3])))
+        lines = [f"【公开招募保底组合】（{' / '.join(norm_tags)}）"]
+        for _, min_r, comb, ops in combos[:8]:
+            badge = "★1 支援机械" if "支援机械" in comb else f"保底{min_r}★"
+            op_names = "、".join(f"{o['name']}({o['rarity']}★)" for o in ops[:6])
+            if len(ops) > 6:
+                op_names += f" 等{len(ops)}人"
+            lines.append(f"• [{badge}] {' + '.join(comb)} → {op_names}")
+        return "\n".join(lines)

@@ -23,9 +23,15 @@ from maibot_sdk import (
     Tool,
 )
 from maibot_sdk.types import HookMode, HookOrder, ToolParameterInfo, ToolParamType
+from pydantic import model_validator
 
-from .cards import build_operator_card_html
-from .matcher import ArknightsContextMatcher
+from .cards import build_help_card_html, build_operator_card_html
+from .matcher import (
+    ArknightsContextMatcher,
+    load_runtime_aliases,
+    parse_custom_alias_line,
+    save_runtime_aliases,
+)
 from .prts import PRTSClient
 
 PLUGIN_ID = "feiyu.arknights-wiki"
@@ -49,36 +55,88 @@ class PluginSection(PluginConfigBase):
         description="是否启用明日方舟wiki插件",
         json_schema_extra={"label": "启用插件"},
     )
-    config_version: str = Field(default="0.2.0", description="配置版本")
+    config_version: str = Field(default="0.3.0", description="配置版本")
+
+
+_LIST_MODE_MAP = {
+    "off": "不限制",
+    "none": "不限制",
+    "all": "不限制",
+    "不限制": "不限制",
+    "whitelist": "仅白名单",
+    "white": "仅白名单",
+    "仅白名单": "仅白名单",
+    "blacklist": "排除黑名单",
+    "black": "排除黑名单",
+    "排除黑名单": "排除黑名单",
+}
 
 
 class ScopeSection(PluginConfigBase):
-    """按群聊 / 私聊黑白名单控制生效范围。"""
+    """按群聊 / 私聊开关与黑白名单控制生效范围。"""
 
-    __ui_label__ = "生效范围"
+    __ui_label__ = "生效范围与黑白名单"
     __ui_icon__ = "shield"
     __ui_order__ = 1
 
-    group_whitelist: list[str] = Field(
-        default_factory=list,
-        description="群聊白名单（留空为全群生效，支持纯群号或 platform:id 如 qq:123456）",
-        json_schema_extra={"label": "群聊白名单"},
+    allow_group: bool = Field(
+        default=True,
+        description="是否允许在群聊中使用本插件（含黑话感知、工具与指令）",
+        json_schema_extra={"label": "允许群聊使用"},
     )
-    group_blacklist: list[str] = Field(
-        default_factory=list,
-        description="群聊黑名单",
-        json_schema_extra={"label": "群聊黑名单"},
+    allow_private: bool = Field(
+        default=True,
+        description="是否允许在私聊中使用本插件",
+        json_schema_extra={"label": "允许私聊使用"},
     )
-    private_whitelist: list[str] = Field(
-        default_factory=list,
-        description="私聊白名单（留空为全私聊生效）",
-        json_schema_extra={"label": "私聊白名单"},
+    group_list_mode: str = Field(
+        default="不限制",
+        description="群聊名单过滤模式：不限制 / 仅白名单 / 排除黑名单",
+        json_schema_extra={"label": "群聊名单模式", "choices": ["不限制", "仅白名单", "排除黑名单"]},
     )
-    private_blacklist: list[str] = Field(
+    group_list: list[str] = Field(
         default_factory=list,
-        description="私聊黑名单",
-        json_schema_extra={"label": "私聊黑名单"},
+        description="群聊名单（支持纯群号、platform:群号 如 qq:123456、Telegram 父群号或群名称）",
+        json_schema_extra={"label": "群聊名单列表"},
     )
+    private_list_mode: str = Field(
+        default="不限制",
+        description="私聊名单过滤模式：不限制 / 仅白名单 / 排除黑名单",
+        json_schema_extra={"label": "私聊名单模式", "choices": ["不限制", "仅白名单", "排除黑名单"]},
+    )
+    private_list: list[str] = Field(
+        default_factory=list,
+        description="私聊名单（支持纯用户 ID、platform:用户ID 或 OpenID）",
+        json_schema_extra={"label": "私聊名单列表"},
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_scope(cls, data: Any) -> Any:
+        """无缝兼容 v0.1/v0.2 的 group_whitelist/blacklist 与英文模式值。"""
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        for k in ("group_list_mode", "private_list_mode"):
+            if k in d and isinstance(d[k], str):
+                d[k] = _LIST_MODE_MAP.get(d[k].strip().lower(), d[k].strip())
+        if not d.get("group_list"):
+            if d.get("group_whitelist"):
+                d["group_list_mode"] = "仅白名单"
+                d["group_list"] = list(d["group_whitelist"])
+            elif d.get("group_blacklist"):
+                d["group_list_mode"] = "排除黑名单"
+                d["group_list"] = list(d["group_blacklist"])
+        if not d.get("private_list"):
+            if d.get("private_whitelist"):
+                d["private_list_mode"] = "仅白名单"
+                d["private_list"] = list(d["private_whitelist"])
+            elif d.get("private_blacklist"):
+                d["private_list_mode"] = "排除黑名单"
+                d["private_list"] = list(d["private_blacklist"])
+        for old_k in ("group_whitelist", "group_blacklist", "private_whitelist", "private_blacklist"):
+            d.pop(old_k, None)
+        return d
 
 
 class ContextSection(PluginConfigBase):
@@ -108,8 +166,8 @@ class ContextSection(PluginConfigBase):
     max_hint_items: int = Field(
         default=6,
         ge=1,
-        le=12,
-        description="单轮最多注入的方舟词条参考数",
+        le=8,
+        description="单轮最多注入的方舟词条参考数（默认 6 条，兼顾准确度与省 Token）",
         json_schema_extra={"label": "单轮最大注入词条数"},
     )
 
@@ -128,7 +186,7 @@ class CommandSection(PluginConfigBase):
     )
     admin_users: list[str] = Field(
         default_factory=list,
-        description="允许在群聊执行 /方舟 清理缓存 的管理员用户 ID 列表（留空时自动读取宿主 master_users，均未配置则仅私聊可清理）",
+        description="清理缓存和增删别名的管理员 ID（支持 platform:用户ID；留空时读取宿主 plugin.permission，均未配置则仅限已识别的私聊）",
         json_schema_extra={"label": "缓存管理管理员 ID"},
     )
 
@@ -146,7 +204,7 @@ class PRTSSection(PluginConfigBase):
         json_schema_extra={"label": "API 地址"},
     )
     user_agent: str = Field(
-        default="MaiBot-ArknightsWiki/0.2.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
+        default="MaiBot-ArknightsWiki/0.3.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
         description="礼貌 User-Agent（遵循 MediaWiki API 规范）",
         json_schema_extra={"label": "User-Agent"},
     )
@@ -182,7 +240,7 @@ class RenderSection(PluginConfigBase):
 
     enable_cards: bool = Field(
         default=True,
-        description="开启后支持将干员材料、模组与面板渲染为 2x 高清工业风卡片图",
+        description="开启后支持将干员材料、模组与面板渲染为 2x 高清黑曜石金箔风格卡片图",
         json_schema_extra={"label": "启用高清卡片图"},
     )
     auto_card_in_chat: bool = Field(
@@ -228,16 +286,25 @@ class CacheSection(PluginConfigBase):
 
 
 class GlossarySection(PluginConfigBase):
-    """自定义追加群内方舟别称与外号。"""
+    """自定义追加群内方舟黑话与干员昵称（优先覆盖内置词典）。"""
 
-    __ui_label__ = "自定义别称"
+    __ui_label__ = "自定义黑话与昵称"
     __ui_icon__ = "tag"
     __ui_order__ = 7
 
     custom_aliases: list[str] = Field(
         default_factory=list,
-        description="自定义追加别称，格式：外号=标准PRTS词条名|简短定位(可选)",
-        json_schema_extra={"label": "自定义别称列表"},
+        description="点击「+ 添加项目」逐条填写，示例：牢猫=凯尔希 或 牢猫=凯尔希|6★医疗（也支持冒号或空格分隔，如 大肥鱼 斯卡蒂）",
+        json_schema_extra={
+            "label": "自定义黑话列表（示例：牢猫=凯尔希）",
+            "placeholder": "例：牢猫=凯尔希 或 大肥鱼=斯卡蒂|6★近卫",
+            "hint": "格式：外号=干员名（可选 |简短定位），例如：牢猫=凯尔希",
+        },
+    )
+    custom_alias_force_tier1: bool = Field(
+        default=True,
+        description="开启后，你自定义的昵称/黑话直接作为高置信词命中（无需等待上下文热态）；关闭则对短词启用防误触门控",
+        json_schema_extra={"label": "自定义黑话直接高置信命中"},
     )
 
 
@@ -266,23 +333,101 @@ def _resolve_data_dir() -> Path:
 
 
 def _send_ok(res: Any) -> bool:
-    """兼容不同宿主版本 / 适配器的发送返回值判定。"""
+    """仅把 SDK 的布尔回执或明确标记成功的详情视为送达。"""
     if isinstance(res, bool):
         return res
     if isinstance(res, dict):
-        if "success" in res:
-            return bool(res["success"])
-        if "sent" in res:
-            return bool(res["sent"])
-    return bool(res)
+        return res.get("sent", res.get("success")) is True
+    return False
 
 
-def _norm_token(raw: str) -> str:
-    s = str(raw or "").strip().lower()
-    for pfx in ("qq:", "qq_official:", "onebot:", "napcat:", "snowluma:", "telegram:", "tg:", "weixin:", "wechat:", "internal:"):
-        if s.startswith(pfx):
-            return s[len(pfx) :]
-    return s
+_RE_RECRUIT_COMMAND = re.compile(r"^/(?:公招|公开招募|recruit)(?:\s+(?P<args>.*))?$")
+_RE_WIKI_COMMAND = re.compile(r"^/(?:方舟|prts|ark)(?:\s+(?P<args>.*))?$")
+_RE_ILLUSTRATION_COMMAND = re.compile(r"^/(?:立绘|方舟立绘|ak图)(?:\s+(?P<args>.*))?$")
+
+
+def _command_args(kwargs: dict[str, Any], pattern: re.Pattern[str]) -> str:
+    groups = kwargs.get("matched_groups")
+    if isinstance(groups, dict) and "args" in groups:
+        return str(groups["args"] or "").strip()
+    # 兼容未传匹配组的旧宿主与直接调用。
+    text = kwargs.get("matched_text") or kwargs.get("text")
+    message = kwargs.get("message")
+    if not text and isinstance(message, dict):
+        text = message.get("processed_plain_text") or message.get("raw_message")
+    match = pattern.fullmatch(str(text or "").strip())
+    return (match.group("args") or "").strip() if match else ""
+
+
+def _exc_text(exc: BaseException) -> str:
+    """把异常转成能给人看的文本。
+
+    底层超时经常是空消息（httpcore 抛 `ReadTimeout()`，httpx 原样保留空串），
+    直接 f"{exc}" 会发出「获取立绘失败：」这种半截提示。这里补上可读说明。
+    """
+    msg = str(exc).strip()
+    if msg:
+        return msg
+    if isinstance(exc, TimeoutError) or "Timeout" in type(exc).__name__:
+        return "请求 PRTS 超时（网络较慢或图片较大），隔一会儿重试即可"
+    name = type(exc).__name__
+    return f"{name}（无错误详情）"
+
+
+_PLATFORM_NAMES = {
+    "qq": "qq", "qq_official": "qq", "qqbot": "qq", "onebot": "qq",
+    "napcat": "qq", "snowluma": "qq", "tg": "telegram", "telegram": "telegram",
+    "weixin_clawbot": "weixin_clawbot", "weixin": "weixin_clawbot", "wechat": "weixin_clawbot",
+    "internal": "internal", "webui": "internal", "bot_console": "bot_console", "discord": "discord",
+}
+_TELEGRAM_TOPIC_ID = re.compile(r"(-?\d+):\d+")
+
+
+def _split_scope_id(raw: str) -> tuple[str, str]:
+    value = str(raw or "").strip()
+    prefix, sep, identifier = value.partition(":")
+    platform = _PLATFORM_NAMES.get(prefix.lower(), "") if sep else ""
+    return (platform, identifier.strip()) if platform else ("", value)
+
+
+def _scope_list_hit(rules: list[str], identifier: str, platform: str, *, group_name: str = "", group: bool = False) -> bool:
+    supplied_platform, identifier = _split_scope_id(identifier)
+    actual_platform = _PLATFORM_NAMES.get(platform, platform) or supplied_platform
+    identifiers = {identifier}
+    topic = _TELEGRAM_TOPIC_ID.fullmatch(identifier) if group and actual_platform == "telegram" else None
+    if topic:
+        identifiers.add(topic.group(1))
+    name = group_name.strip().casefold()
+    for rule in rules:
+        rule_platform, value = _split_scope_id(rule)
+        if not value or (rule_platform and rule_platform != actual_platform):
+            continue
+        if value in identifiers or (name and name == value.casefold()):
+            return True
+    return False
+
+
+def _message_info(kwargs: dict[str, Any]) -> dict[str, Any]:
+    message = kwargs.get("message")
+    info = message.get("message_info") if isinstance(message, dict) else None
+    return info if isinstance(info, dict) else {}
+
+
+def _message_group_name(kwargs: dict[str, Any]) -> str:
+    group = _message_info(kwargs).get("group_info")
+    return str(group.get("group_name") or "").strip() if isinstance(group, dict) else ""
+
+
+def _is_private_command(kwargs: dict[str, Any]) -> bool:
+    info = _message_info(kwargs)
+    return "group_info" in info and info["group_info"] is None
+
+
+def _output_platform(kwargs: dict[str, Any], platform: str) -> str:
+    meta = _message_info(kwargs).get("additional_config")
+    if platform == "qq" and isinstance(meta, dict) and (meta.get("qq_official_user_openid") or meta.get("qq_official_group_openid")):
+        return "qq_official"
+    return platform
 
 
 def _extract_user_texts_from_items(items: list[Any], max_items: int = 6) -> list[str]:
@@ -346,8 +491,16 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         self._store = None
         self._matcher: Optional[ArknightsContextMatcher] = None
         self._prts: Optional[PRTSClient] = None
+        self._data_dir: Path = _resolve_data_dir()
         self._recent_hint_sessions: dict[str, float] = {}
         self._recent_cards: dict[tuple[str, str, str], float] = {}
+        # 已渲染卡片 PNG(base64) 缓存：(干员, 板块, 细分, 倍率) -> (时间戳, base64)，1 小时有效、最多 24 张
+        self._card_png: dict[tuple[str, str, str, float], tuple[float, str]] = {}
+        # 帮助图内容固定：倍率 -> base64，进程内只截一次
+        self._help_png: dict[float, str] = {}
+        self._stream_meta_cache: dict[str, tuple[str, str, str, str]] = {}
+        self._stream_meta_ts: float = 0.0
+        self._no_image_platforms: set[str] = {"bot_console", "weixin", "wechat"}
 
     @property
     def cfg(self) -> ArknightsWikiConfig:
@@ -359,19 +512,41 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             pass
         return ArknightsWikiConfig()
 
+    def _runtime_alias_path(self) -> Path:
+        return self._data_dir / "custom_aliases.json"
+
+    def _merged_custom_aliases(self) -> list[str]:
+        cfg_aliases = list(self.cfg.glossary.custom_aliases or [])
+        rt_aliases = load_runtime_aliases(self._runtime_alias_path())
+        # 运行时动态添加的放在后面以覆盖同名旧项
+        return cfg_aliases + rt_aliases
+
+    def _rebuild_matcher(self) -> None:
+        glossary_path = Path(__file__).resolve().parent / "assets" / "glossary.json"
+        cfg = self.cfg
+        self._matcher = ArknightsContextMatcher(
+            glossary_path=glossary_path,
+            custom_aliases=self._merged_custom_aliases(),
+            hot_ttl_seconds=float(cfg.context.hot_session_ttl_seconds),
+            custom_alias_force_tier1=bool(cfg.glossary.custom_alias_force_tier1),
+        )
+        if self._prts is not None:
+            self._prts.matcher = self._matcher
+
     def _build_services(self) -> None:
         from .store import WikiCacheStore
 
-        ctx_paths = getattr(self.ctx, "paths", None) if self.ctx else None
+        try:
+            ctx = self.ctx
+        except RuntimeError:
+            ctx = None
+        ctx_paths = getattr(ctx, "paths", None) if ctx else None
         data_dir = Path(ctx_paths.data_dir) if ctx_paths and getattr(ctx_paths, "data_dir", None) else _resolve_data_dir()
-        glossary_path = Path(__file__).resolve().parent / "assets" / "glossary.json"
+        self._data_dir = data_dir
         cfg = self.cfg
         self._store = WikiCacheStore(data_dir=data_dir, image_max_mb=cfg.cache.image_cache_max_mb)
-        self._matcher = ArknightsContextMatcher(
-            glossary_path=glossary_path,
-            custom_aliases=cfg.glossary.custom_aliases,
-            hot_ttl_seconds=float(cfg.context.hot_session_ttl_seconds),
-        )
+        self._rebuild_matcher()
+        assert self._matcher is not None
         self._prts = PRTSClient(
             store=self._store,
             matcher=self._matcher,
@@ -414,77 +589,145 @@ class ArknightsWikiPlugin(MaiBotPlugin):
     def _is_enabled(self) -> bool:
         return bool(self.cfg.plugin.enabled and self._matcher and self._prts)
 
-    def _scope_allowed(self, *, group_id: str = "", user_id: str = "") -> bool:
+    def _scope_allowed(self, *, group_id: str = "", user_id: str = "", group_name: str = "", platform: str = "") -> bool:
         sc = self.cfg.scope
         if group_id:
-            candidates = {group_id.lower(), _norm_token(group_id)}
-            if ":" in group_id:
-                candidates.add(group_id.split(":", 1)[0].lower())
-            bl = {_norm_token(x) for x in sc.group_blacklist} | {x.strip().lower() for x in sc.group_blacklist}
-            if candidates & bl:
+            if not sc.allow_group:
                 return False
-            if sc.group_whitelist:
-                wl = {_norm_token(x) for x in sc.group_whitelist} | {x.strip().lower() for x in sc.group_whitelist}
-                return bool(candidates & wl)
-            return True
+            mode = _LIST_MODE_MAP.get(str(sc.group_list_mode or "").strip().lower(), "不限制")
+            if mode == "不限制":
+                return True
+            hit = _scope_list_hit(sc.group_list, group_id, platform, group_name=group_name, group=True)
+            return hit if mode == "仅白名单" else (not hit)
 
         if user_id:
-            candidates = {user_id.lower(), _norm_token(user_id)}
-            bl = {_norm_token(x) for x in sc.private_blacklist} | {x.strip().lower() for x in sc.private_blacklist}
-            if candidates & bl:
+            if not sc.allow_private:
                 return False
-            if sc.private_whitelist:
-                wl = {_norm_token(x) for x in sc.private_whitelist} | {x.strip().lower() for x in sc.private_whitelist}
-                return bool(candidates & wl)
+            mode = _LIST_MODE_MAP.get(str(sc.private_list_mode or "").strip().lower(), "不限制")
+            if mode == "不限制":
+                return True
+            hit = _scope_list_hit(sc.private_list, user_id, platform)
+            return hit if mode == "仅白名单" else (not hit)
         return True
 
-    async def _can_clear_cache(self, *, group_id: str = "", user_id: str = "") -> bool:
-        """校验是否允许执行破坏性缓存清理指令，防止群聊普通成员误触或恶意刷清缓存。"""
-        admins: set[str] = set()
-        for raw in self.cfg.commands.admin_users or []:
-            s = str(raw or "").strip().lower()
-            if s:
-                admins.add(s)
-                admins.add(_norm_token(s))
-
-        # 尝试补充读取宿主配置中的 master_users（兼容列表或单值）
+    async def _resolve_stream_meta(self, stream_id: str) -> tuple[str, str, str, str]:
+        """按 stream_id 轻量反查 (platform, group_id, user_id, group_name)，缓存 60 秒。"""
+        sid = str(stream_id or "").strip()
+        if not sid:
+            return "", "", "", ""
+        now = time.time()
+        # 先看整表新鲜度：60 秒内直接按缓存回答（含未命中）。
+        # 旧逻辑把新鲜度判断挂在「命中」分支上，导致适配器没上报的 stream 每条消息都要全量拉一次流列表。
+        if (now - self._stream_meta_ts) < 60.0:
+            return self._stream_meta_cache.get(sid, ("", "", "", ""))
         try:
             ctx = self.ctx
         except RuntimeError:
             ctx = None
-        if ctx and getattr(ctx, "config", None):
-            for key in ("permission.master_users", "bot.master_users"):
-                try:
-                    val = await ctx.config.get(key)
-                except Exception:
-                    val = None
-                if isinstance(val, (list, tuple, set)):
-                    for item in val:
-                        if isinstance(item, (list, tuple)) and len(item) >= 2:
-                            s = f"{item[0]}:{item[1]}".strip().lower()
-                        else:
-                            s = str(item or "").strip().lower()
-                        if s:
-                            admins.add(s)
-                            admins.add(_norm_token(s))
-                elif isinstance(val, str) and val.strip():
-                    admins.add(val.strip().lower())
-                    admins.add(_norm_token(val))
+        chat = getattr(ctx, "chat", None) if ctx else None
+        if chat and hasattr(chat, "get_all_streams"):
+            try:
+                streams = await chat.get_all_streams(platform="all_platforms")
+                if isinstance(streams, list):
+                    fresh: dict[str, tuple[str, str, str, str]] = {}
+                    for st in streams:
+                        if not isinstance(st, dict):
+                            continue
+                        k = str(st.get("stream_id") or st.get("session_id") or "").strip()
+                        if not k:
+                            continue
+                        plat = str(st.get("platform") or "").strip().lower()
+                        gid = str(st.get("group_id") or "").strip()
+                        uid = str(st.get("user_id") or "").strip()
+                        gname = str(st.get("group_name") or st.get("name") or "").strip()
+                        fresh[k] = (plat, gid, uid, gname)
+                    if fresh:
+                        self._stream_meta_cache = fresh
+            except Exception:
+                pass
+        # 无论成功、空结果还是异常都记时间戳：否则宿主返回空列表/一直报错时，每条消息都会重试一次全量拉取
+        self._stream_meta_ts = now
+        return self._stream_meta_cache.get(sid, ("", "", "", ""))
 
-        if admins:
-            if not user_id:
-                return False
-            cands = {user_id.strip().lower(), _norm_token(user_id)}
-            return bool(cands & admins)
+    async def _scope_allowed_async(
+        self,
+        *,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        platform: str = "",
+        group_name: str = "",
+    ) -> tuple[bool, str]:
+        """全平台异步生效范围校验，返回 (是否放行, 识别到的平台名)。"""
+        sc = self.cfg.scope
+        group_mode = _LIST_MODE_MAP.get(str(sc.group_list_mode or "").strip().lower(), "不限制")
+        gname = group_name
+        plat = str(platform or "").strip().lower()
+        needs_group_name = group_id and not gname and group_mode != "不限制" and sc.group_list
+        if stream_id and (not group_id or not plat or needs_group_name):
+            m_plat, m_gid, m_uid, m_gname = await self._resolve_stream_meta(stream_id)
+            plat = plat or m_plat
+            group_id = group_id or m_gid
+            if not group_id:
+                user_id = user_id or m_uid
+            gname = gname or m_gname
+        if not group_id and not user_id:
+            private_mode = _LIST_MODE_MAP.get(str(sc.private_list_mode or "").strip().lower(), "不限制")
+            if not sc.allow_group or not sc.allow_private or group_mode != "不限制" or private_mode != "不限制":
+                return False, plat
+        allowed = self._scope_allowed(group_id=group_id, user_id=user_id, group_name=gname, platform=plat)
+        return allowed, plat
 
-        # 未配置任何管理员时：私聊允许清理，群聊默认拒绝
-        return not bool(group_id)
+    def _platform_no_image(self, platform: str) -> bool:
+        p = str(platform or "").strip().lower()
+        return bool(p and p in self._no_image_platforms)
 
     @staticmethod
-    def _extract_stream_and_ids(kwargs: dict[str, Any]) -> tuple[str, str, str]:
+    def _sanitize_for_platform(text: str, platform: str) -> str:
+        """针对 QQ 官方机器人等禁止外链 URL 的平台自动剥离裸链接，避免消息被平台拦截。"""
+        p = str(platform or "").strip().lower()
+        if p in ("qq_official", "qqbot", "weixin_clawbot"):
+            text = re.sub(r"\n?PRTS条目[：:]\s*https?://\S+", "", text)
+            text = re.sub(r"https?://\S+", "（已略去链接，可在 PRTS Wiki 搜索查看）", text)
+        return text.strip()
+
+    async def _can_clear_cache(
+        self, *, group_id: str = "", user_id: str = "", platform: str = "", private: bool = False,
+    ) -> bool:
+        """校验缓存清理与别名增删权限。"""
+        if not user_id:
+            return False
+        admins = [item for item in self.cfg.commands.admin_users if item.strip()]
+        if admins:
+            return _scope_list_hit(admins, user_id, platform)
+
+        try:
+            config = getattr(self.ctx, "config", None)
+        except RuntimeError:
+            config = None
+        if config is not None:
+            for key in ("plugin.permission", "permission.master_users", "bot.master_users"):
+                try:
+                    value = await config.get(key)
+                except Exception:
+                    return False
+                if isinstance(value, str):
+                    value = [value]
+                if isinstance(value, (list, tuple)):
+                    admins = [
+                        f"{item[0]}:{item[1]}" if isinstance(item, (list, tuple)) and len(item) >= 2 else str(item)
+                        for item in value if item
+                    ]
+                    if admins:
+                        return _scope_list_hit(admins, user_id, platform)
+        return private and not group_id
+
+    @staticmethod
+    def _extract_stream_and_ids(kwargs: dict[str, Any]) -> tuple[str, str, str, str]:
         stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or "").strip()
         group_id = str(kwargs.get("group_id") or "").strip()
-        user_id = str(kwargs.get("user_id") or "").strip()
+        user_id = str(kwargs.get("user_id") or kwargs.get("sender_id") or "").strip()
+        platform = str(kwargs.get("platform") or "").strip().lower()
         msg = kwargs.get("message")
         if isinstance(msg, dict):
             minfo = msg.get("message_info") if isinstance(msg.get("message_info"), dict) else {}
@@ -492,11 +735,12 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             uinfo = minfo.get("user_info") if isinstance(minfo.get("user_info"), dict) else {}
             stream_id = stream_id or str(msg.get("stream_id") or msg.get("session_id") or minfo.get("session_id") or "")
             group_id = group_id or str(msg.get("group_id") or ginfo.get("group_id") or "")
-            user_id = user_id or str(msg.get("user_id") or uinfo.get("user_id") or "")
-        return stream_id, group_id, user_id
+            user_id = user_id or str(msg.get("user_id") or msg.get("sender_id") or uinfo.get("user_id") or "")
+            platform = platform or str(msg.get("platform") or minfo.get("platform") or "").strip().lower()
+        return stream_id, group_id, user_id, _output_platform(kwargs, platform)
 
     # ============================================================
-    # Hook 1 & 2：微秒级方舟黑话语境感知（零网络、零破坏前缀缓存）
+    # Hook 1 & 2：微秒级方舟黑话语境感知（零网络、零破坏前缀缓存、受黑白名单约束）
     # ============================================================
 
     @HookHandler(
@@ -513,7 +757,10 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         items = kwargs.get("items")
         if not isinstance(items, list) or not items:
             return {"action": "continue"}
-        session_id = str(kwargs.get("session_id") or "").strip()
+        session_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        allowed, _ = await self._scope_allowed_async(stream_id=session_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
+            return {"action": "continue"}
 
         recent_texts = _extract_user_texts_from_items(items, max_items=6)
         if not recent_texts or not self._matcher:
@@ -531,6 +778,12 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         if hint and _append_note_to_last_user_item(items, hint):
             if session_id:
                 self._recent_hint_sessions[session_id] = time.time()
+                # 只用于 30 秒内的 replyer 联动，防止长期运行后字典无限增长
+                if len(self._recent_hint_sessions) > 512:
+                    now_ts = time.time()
+                    self._recent_hint_sessions = {
+                        k: t for k, t in self._recent_hint_sessions.items() if now_ts - t <= 30.0
+                    }
             return {"action": "continue", "modified_kwargs": kwargs}
         return {"action": "continue"}
 
@@ -545,15 +798,15 @@ class ArknightsWikiPlugin(MaiBotPlugin):
     async def on_replyer_before_request(self, **kwargs: Any) -> dict[str, Any]:
         if not self._is_enabled() or not self.cfg.context.enable_replyer_style_hint:
             return {"action": "continue"}
-        session_id = str(kwargs.get("session_id") or "").strip()
+        session_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
         ts = self._recent_hint_sessions.get(session_id)
         if not ts or (time.time() - ts) > 30.0:
             return {"action": "continue"}
+        allowed, _ = await self._scope_allowed_async(stream_id=session_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
+            return {"action": "continue"}
         extra = str(kwargs.get("extra_prompt") or "")
-        style_note = (
-            "平时响应群友调侃或聊《明日方舟》话题时，最多只说 1～2 句简短自然口语（35 字以内），严禁长篇大论刷屏；"
-            "提及材料或数值时用顿号连接，避免大量空格和“+”号，不要机械复读百科模板。"
-        )
+        style_note = "聊方舟时最多说1～2句自然短口语（35字内），不背百科不刷屏。"
         if style_note not in extra:
             kwargs["extra_prompt"] = f"{extra}\n{style_note}".strip()
             return {"action": "continue", "modified_kwargs": kwargs}
@@ -571,9 +824,12 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         detail: str = "",
         *,
         dedup_seconds: float = 15.0,
+        platform: str = "",
     ) -> tuple[bool, str]:
-        """将干员材料/模组/总览/技能渲染为 2x 高清工业风卡片并直发，返回 (是否发图成功, 干员标准名)。"""
+        """将干员材料/模组/总览/技能渲染为 2x 高清黑曜石金箔风格卡片并直发，返回 (是否发图成功, 干员标准名)。"""
         if not self.cfg.render.enable_cards or not self._prts or not self.ctx or not stream_id:
+            return False, ""
+        if self._platform_no_image(platform):
             return False, ""
         render = getattr(self.ctx, "render", None)
         if render is None:
@@ -583,39 +839,49 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         if sec not in ("overview", "skills", "modules", "materials"):
             return False, ""
 
-        op = await self._prts.get_operator_struct(target)
-        if not op:
-            return False, ""
-        op_name = op["name"]
-
-        # 防止 Planner 同一轮并发调用两次（如 modules + materials 查同一干员）连发两张刷屏
-        card_group = "materials_or_modules" if sec in ("modules", "materials") else "overview_or_skills"
-        dedup_key = (stream_id, op_name, card_group)
-        now = time.time()
-        if dedup_seconds > 0 and (now - self._recent_cards.get(dedup_key, 0.0)) < dedup_seconds:
-            return False, op_name
-
+        op_name = ""
         try:
-            html_str, vp_w, vp_h = await build_operator_card_html(
-                self._prts,
-                op,
-                section=sec,
-                detail=detail,
-            )
-            scale = float(self.cfg.render.card_scale or 2.0)
-            res = await render.html2png(
-                html_str,
-                selector=".card",
-                viewport={"width": vp_w + 40, "height": max(320, vp_h)},
-                device_scale_factor=scale,
-                omit_background=True,
-                wait_until="domcontentloaded",
-                allow_network=False,
-                render_timeout_ms=15000,
-            )
-            b64 = res.get("image_base64") if isinstance(res, dict) else None
-            if not b64:
+            op = await self._prts.get_operator_struct(target)
+            if not op:
+                return False, ""
+            op_name = op["name"]
+
+            # 同一会话短时间内避免重复发同类卡片。
+            card_group = "materials_or_modules" if sec in ("modules", "materials") else "overview_or_skills"
+            dedup_key = (stream_id, op_name, card_group)
+            now = time.time()
+            if dedup_seconds > 0 and (now - self._recent_cards.get(dedup_key, 0.0)) < dedup_seconds:
                 return False, op_name
+
+            scale = float(self.cfg.render.card_scale or 2.0)
+            ckey = (op_name, sec, (detail or "").strip().lower(), scale)
+            hit = self._card_png.get(ckey)
+            if hit and now - hit[0] < 3600.0:
+                b64 = hit[1]
+            else:
+                html_str, vp_w, vp_h, complete = await build_operator_card_html(
+                    self._prts,
+                    op,
+                    section=sec,
+                    detail=detail,
+                )
+                res = await render.html2png(
+                    html_str,
+                    selector=".card",
+                    viewport={"width": vp_w + 40, "height": max(320, vp_h)},
+                    device_scale_factor=scale,
+                    omit_background=True,
+                    wait_until="domcontentloaded",
+                    allow_network=False,
+                    render_timeout_ms=15000,
+                )
+                b64 = res.get("image_base64") if isinstance(res, dict) else None
+                if not b64:
+                    return False, op_name
+                if complete:
+                    self._card_png[ckey] = (now, str(b64))
+                    while len(self._card_png) > 24:
+                        self._card_png.pop(next(iter(self._card_png)))
             sent = await self.ctx.send.image(str(b64), stream_id=stream_id)
             if _send_ok(sent):
                 self._recent_cards[dedup_key] = now
@@ -624,8 +890,64 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 return True, op_name
         except Exception as exc:
             if self.ctx:
-                self.ctx.logger.warning(f"[明日方舟wiki插件] 卡片渲染或发送失败（已降级纯文本）: {exc}")
+                self.ctx.logger.warning(f"[明日方舟wiki插件] 卡片渲染或发送失败（已降级纯文本）: {_exc_text(exc)}")
         return False, op_name
+
+    async def _command_reply(
+        self, stream_id: str, text: str, response: str, *, platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """报告发送结果；已处理的指令即使发送失败也不进入普通聊天。"""
+        text = self._sanitize_for_platform(text, platform)
+        try:
+            if text and _send_ok(await self.ctx.send.text(text, stream_id=stream_id)):
+                return True, response, 2
+        except Exception as exc:
+            self.ctx.logger.warning(f"[明日方舟wiki插件] 指令回复发送异常（{type(exc).__name__}）: {exc!r}")
+        else:
+            self.ctx.logger.warning("[明日方舟wiki插件] 指令回复未获得成功发送回执")
+        return False, "指令回复发送失败", 2
+
+    async def _send_help_card_or_text(self, stream_id: str, platform: str = "") -> tuple[bool, str, int]:
+        """优先发送轻量化总帮助 2x 渲染图，平台不支持或渲染不可用时自动降级纯文本。"""
+        if self.ctx and self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                try:
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    b64 = self._help_png.get(scale)
+                    if not b64:
+                        html_str, vp_w, vp_h = build_help_card_html()
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": vp_h + 40},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=10000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64:
+                            self._help_png[scale] = str(b64)
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        return True, "已发送帮助卡片", 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 帮助图渲染失败（已降级纯文本）: {_exc_text(exc)}")
+
+        help_msg = (
+            "【明日方舟wiki插件 · 全部指令】\n"
+            "• /方舟帮助  （显示指令速查图）\n"
+            "• /方舟 <干员/外号/词条> [总览|技能|模组|材料|档案]\n"
+            "• /方舟 总计 <干员> [精二|一二三技能|模组]  （一键算养成材料总账）\n"
+            "• /立绘 <干员/外号> [精二|初始|皮肤1|皮肤名|列表]\n"
+            "• /公招 <词条1> <词条2> ...  （公招保底组合计算器）\n"
+            "• /方舟 活动  （速查国服当期活动与卡池）\n"
+            "• /方舟 语音 <干员> [戳一戳|信赖|交谈|随机]\n"
+            "• /方舟 别名 [列表|添加 外号 干员|删除 外号]\n"
+            "• /方舟 缓存  /  /方舟 清理缓存（群聊限管理员）"
+        )
+        return await self._command_reply(stream_id, help_msg, "已发送帮助文本", platform=platform)
 
     # ============================================================
     # Tool 1 & 2：显式可见工具（visibility="visible"，首轮即可调）
@@ -633,36 +955,31 @@ class ArknightsWikiPlugin(MaiBotPlugin):
 
     @Tool(
         name="ak_wiki_query",
-        description=(
-            "查询《明日方舟》PRTS Wiki 权威资料（支持玩家外号如 42/ew/水陈/叔叔/小羊/异德/奶羊 等）。"
-            "可按 section 精准获取干员总览(overview)、技能专三数值(skills)、专属模组与效果(modules)、"
-            "精二/专精/模组升级材料(materials)、干员档案故事(lore)或任意活动/剧情/敌人/术语词条(wiki)。"
-            "查材料(materials)或模组(modules)时会自动向群里发送高清材料/模组图标卡片图；查总览/技能时也可设 send_card=true 发战术面板图。"
-        ),
+        description="查《明日方舟》PRTS Wiki（支持外号）。查材料/模组时自动发卡片图。",
         parameters=[
             ToolParameterInfo(
                 name="target",
                 param_type=ToolParamType.STRING,
-                description="要查询的干员名、玩家外号或 PRTS 词条名（如：维什戴尔、ew、42、玛恩纳、集成战略）",
-                required=True,
+                description="干员名、外号或词条名（查活动可留空）",
+                required=False,
             ),
             ToolParameterInfo(
                 name="section",
                 param_type=ToolParamType.STRING,
-                description="查询板块：overview(总览) / skills(技能) / modules(模组) / materials(升级材料) / lore(干员档案故事) / wiki(通用词条)",
+                description="板块：overview总览/skills技能/modules模组/materials材料/summary材料总账/voice语音/events当期活动/lore档案/wiki词条",
                 required=False,
-                enum_values=["overview", "skills", "modules", "materials", "lore", "wiki"],
+                enum_values=["overview", "skills", "modules", "materials", "summary", "voice", "events", "lore", "wiki"],
             ),
             ToolParameterInfo(
                 name="detail",
                 param_type=ToolParamType.STRING,
-                description="可选聚焦关键词（例如查材料时填「精二」「三技能」「模组」；查档案时填「晋升记录」「模组故事」）",
+                description="可选聚焦词（如 精二/三技能/模组/戳一戳/随机）",
                 required=False,
             ),
             ToolParameterInfo(
                 name="send_card",
                 param_type=ToolParamType.BOOLEAN,
-                description="是否顺手向聊天发送高清战术卡片图（查 materials/modules 时默认自动发送；查 overview/skills 时按需设为 true）",
+                description="是否发高清卡片图（materials/modules 默认开启）",
                 required=False,
             ),
         ],
@@ -677,55 +994,57 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> dict[str, Any]:
         if not self._is_enabled() or not self._prts:
-            return {"success": False, "content": "明日方舟wiki插件未启用。"}
-        stream_id, gid, uid = self._extract_stream_and_ids(kwargs)
-        if not self._scope_allowed(group_id=gid, user_id=uid):
-            return {"success": False, "content": "当前会话未开启明日方舟wiki插件。"}
-        if not str(target or "").strip():
-            return {"success": False, "content": "请提供要查询的干员名或词条名。"}
+            return {"success": False, "content": "明日方舟wiki插件未启用。", "error": "明日方舟wiki插件未启用。"}
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        allowed, plat = await self._scope_allowed_async(stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
+            return {"success": False, "content": "当前会话未开启明日方舟wiki插件。", "error": "当前会话未开启明日方舟wiki插件。"}
         sec = str(section or "overview").strip().lower()
+        if sec not in ("events", "event", "活动", "卡池", "寻访") and not str(target or "").strip():
+            return {"success": False, "content": "请提供要查询的干员名或词条名。", "error": "请提供要查询的干员名或词条名。"}
         try:
             text = await self._prts.query_wiki(target=str(target).strip(), section=sec, detail=str(detail or ""))
         except Exception as exc:
-            return {"success": False, "content": f"查询 PRTS Wiki 失败：{exc}"}
+            return {"success": False, "content": f"查询 PRTS Wiki 失败：{_exc_text(exc)}", "error": f"查询 PRTS Wiki 失败：{_exc_text(exc)}"}
+        text = self._sanitize_for_platform(text, plat)
+        # 控制回传给 LLM 的单次文本上限，避免超长词条消耗过多输入 Token
+        if len(text) > 1200:
+            text = text[:1185].rstrip() + "\n…（内容过长已精简）"
 
-        # 决定是否附发 2x 高清战术卡片图（聊天查材料/模组默认开启，日常纯闲聊不滥发）
+        # 决定是否附发 2x 高清战术卡片图（聊天查材料/模组默认开启，不支持发图平台自动跳过）
         want_card = (
             bool(send_card)
             if send_card is not None
             else (self.cfg.render.auto_card_in_chat and sec in ("materials", "modules"))
         )
         card_sent = False
-        if want_card and stream_id:
+        if want_card and stream_id and not self._platform_no_image(plat):
             card_sent, _ = await self._render_and_send_card(
                 stream_id=stream_id,
                 target=str(target).strip(),
                 section=sec,
                 detail=str(detail or ""),
+                platform=plat,
             )
         if card_sent:
             stop_now = bool(self.cfg.render.stop_planner_after_image)
-            text += "\n\n【已直接向聊天发送高清罗德岛战术卡片图。】"
-            return {"success": True, "content": text, "stop_after_execution": stop_now}
+            return {"success": True, "content": "已发送高清卡片图。", "stop_after_execution": stop_now}
         return {"success": True, "content": text}
 
     @Tool(
         name="ak_send_illustration",
-        description=(
-            "获取并直接向当前聊天发送《明日方舟》干员高清立绘或皮肤立绘（自动支持玩家外号如 ew/水陈/42/叔叔/小羊）。"
-            "支持 variant=e2(精二默认)、e0(初始)、skin(最新皮肤)、skin1/skin2、皮肤中文名，或 variant=list 查看该干员全部可用立绘与皮肤名称。"
-        ),
+        description="发送《明日方舟》干员精二/初始/皮肤高清立绘（支持外号）。",
         parameters=[
             ToolParameterInfo(
                 name="operator",
                 param_type=ToolParamType.STRING,
-                description="干员名称或玩家外号（如：维什戴尔、ew、42、玛恩纳、艾雅法拉）",
+                description="干员名或外号",
                 required=True,
             ),
             ToolParameterInfo(
                 name="variant",
                 param_type=ToolParamType.STRING,
-                description="立绘版本：e2(精二,默认) / e0(初始) / skin(最新皮肤) / skin1 / 具体皮肤名 / list(仅列出可选立绘不发图)",
+                description="版本：精二(默认)/初始/皮肤1/皮肤名/列表",
                 required=False,
             ),
         ],
@@ -738,104 +1057,183 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> dict[str, Any]:
         if not self._is_enabled() or not self._prts or not self.ctx:
-            return {"success": False, "content": "明日方舟wiki插件未启用。"}
-        stream_id, gid, uid = self._extract_stream_and_ids(kwargs)
-        if not self._scope_allowed(group_id=gid, user_id=uid):
-            return {"success": False, "content": "当前会话未开启明日方舟wiki插件。"}
+            return {"success": False, "content": "明日方舟wiki插件未启用。", "error": "明日方舟wiki插件未启用。"}
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        allowed, plat = await self._scope_allowed_async(stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
+            return {"success": False, "content": "当前会话未开启明日方舟wiki插件。", "error": "当前会话未开启明日方舟wiki插件。"}
         if not str(operator or "").strip():
-            return {"success": False, "content": "请提供干员名称或外号。"}
+            return {"success": False, "content": "请提供干员名称或外号。", "error": "请提供干员名称或外号。"}
 
         try:
             res = await self._prts.fetch_illustration(str(operator).strip(), str(variant or "e2"))
         except Exception as exc:
-            return {"success": False, "content": f"获取干员立绘失败：{exc}"}
+            return {"success": False, "content": f"获取干员立绘失败：{_exc_text(exc)}", "error": f"获取干员立绘失败：{_exc_text(exc)}"}
 
         if not res.ok:
-            return {"success": False, "content": res.error or "获取立绘失败。"}
+            msg = res.error or "获取立绘失败。"
+            return {"success": False, "content": msg, "error": msg}
 
         if res.label == "列表" or not res.image_bytes:
             avail = "、".join(res.available_variants or [])
             return {"success": True, "content": f"干员「{res.operator}」可选立绘：{avail}"}
 
         if not stream_id:
-            return {
-                "success": False,
-                "content": f"已获取「{res.operator}」{res.label}，但当前上下文缺少 stream_id 无法发图。",
-            }
+            msg = f"已获取「{res.operator}」{res.label}，但当前上下文缺少 stream_id 无法发图。"
+            return {"success": False, "content": msg, "error": msg}
 
-        img_b64 = base64.b64encode(res.image_bytes).decode("ascii")
-        try:
-            send_res = await self.ctx.send.image(img_b64, stream_id=stream_id)
-            if _send_ok(send_res):
-                avail = "、".join(res.available_variants or [])
-                stop_now = bool(self.cfg.render.stop_planner_after_image)
-                return {
-                    "success": True,
-                    "content": (
-                        f"已成功向聊天发送干员「{res.operator}」的{res.label}（图源：PRTS Wiki）。"
-                        f"该干员全部可选立绘：{avail}。"
-                    ),
-                    "stop_after_execution": stop_now,
-                }
-        except Exception as exc:
-            if self.ctx:
-                self.ctx.logger.warning(f"[明日方舟wiki插件] 发送立绘异常: {exc}")
+        if not self._platform_no_image(plat):
+            img_b64 = base64.b64encode(res.image_bytes).decode("ascii")
+            try:
+                send_res = await self.ctx.send.image(img_b64, stream_id=stream_id)
+                if _send_ok(send_res):
+                    avail = "、".join(res.available_variants or [])
+                    stop_now = bool(self.cfg.render.stop_planner_after_image)
+                    return {
+                        "success": True,
+                        "content": (
+                            f"已成功向聊天发送干员「{res.operator}」的{res.label}（图源：PRTS Wiki）。"
+                            f"该干员全部可选立绘：{avail}。"
+                        ),
+                        "stop_after_execution": stop_now,
+                    }
+            except Exception as exc:
+                if self.ctx:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 发送立绘异常（{type(exc).__name__}）: {exc!r}")
 
-        # 平台不支持发图时的优雅降级
+        # 平台不支持发图时的优雅降级（对禁止外链平台自动剥离裸 URL）
         fallback = f"当前平台未能直接发送「{res.operator}」{res.label}图片。"
         if res.source_url:
             fallback += f" 可查看 PRTS 原图：{res.source_url}"
-        return {"success": False, "content": fallback}
+        fallback = self._sanitize_for_platform(fallback, plat)
+        return {"success": False, "content": fallback, "error": fallback}
 
     # ============================================================
-    # Command 1 & 2：快捷直出指令（返回三元组 intercept=2，100% 阻止进 Planner）
+    # Commands：快捷直出指令（返回三元组 intercept=2，100% 阻止进 Planner）
     # ============================================================
 
     @Command(
+        name="ak_help_cmd",
+        description="发送明日方舟wiki插件总帮助卡片图：/方舟帮助",
+        pattern=r"^/(?:方舟帮助|方舟指令|prts帮助|ark帮助)\s*$",
+    )
+    async def cmd_help(self, **kwargs: Any) -> tuple[bool, str, int]:
+        if not self._is_enabled() or not self.cfg.commands.enable_commands or not self.ctx:
+            return False, "", 0
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        if not stream_id:
+            return False, "", 0
+        allowed, plat = await self._scope_allowed_async(stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
+            return False, "", 0
+        return await self._send_help_card_or_text(stream_id, platform=plat)
+
+    @Command(
+        name="ak_recruit_cmd",
+        description="公开招募保底组合计算器：/公招 <词条1> <词条2> ...",
+        pattern=_RE_RECRUIT_COMMAND.pattern,
+    )
+    async def cmd_recruit(self, **kwargs: Any) -> tuple[bool, str, int]:
+        if not self._is_enabled() or not self.cfg.commands.enable_commands or not self._prts or not self.ctx:
+            return False, "", 0
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        if not stream_id:
+            return False, "", 0
+        allowed, plat = await self._scope_allowed_async(stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
+            return False, "", 0
+
+        arg_str = _command_args(kwargs, _RE_RECRUIT_COMMAND)
+        tags = [t for t in re.split(r"[\s,，/、+]+", arg_str) if t]
+        try:
+            reply = await self._prts.calculate_recruit(tags)
+        except Exception as exc:
+            reply = f"公招计算失败：{_exc_text(exc)}"
+        return await self._command_reply(stream_id, reply, "已发送公招计算结果", platform=plat)
+
+    async def _handle_alias_subcmd(self, args: list[str], *, gid: str, uid: str, platform: str, private: bool) -> str:
+        """处理 /方舟 别名 [列表|添加|删除] 子命令。"""
+        sub = args[0].lower() if args else "列表"
+        rt_path = self._runtime_alias_path()
+        rt_list = load_runtime_aliases(rt_path)
+
+        if sub in ("列表", "list", "查看", "ls"):
+            cfg_list = list(self.cfg.glossary.custom_aliases or [])
+            lines = ["【自定义黑话/昵称列表】"]
+            if cfg_list:
+                lines.append("▸ 配置页：" + "；".join(cfg_list[:20]))
+            if rt_list:
+                lines.append("▸ 群内热添加：" + "；".join(rt_list[:30]))
+            if not cfg_list and not rt_list:
+                lines.append("暂无自定义黑话。")
+            lines.append("用法：/方舟 别名 添加 <外号> <干员名> [定位]　或　/方舟 别名 删除 <外号>")
+            return "\n".join(lines)
+
+        if not await self._can_clear_cache(group_id=gid, user_id=uid, platform=platform, private=private):
+            return "仅插件管理员可在群聊中增删自定义黑话（可在设置 commands.admin_users 中添加管理员 ID）。"
+
+        if sub in ("添加", "add", "新增", "设置") and len(args) >= 3:
+            alias = args[1].strip()
+            target = args[2].strip()
+            brief = " ".join(args[3:]).strip() if len(args) > 3 else ""
+            entry = f"{alias}={target}|{brief}" if brief else f"{alias}={target}"
+            if not parse_custom_alias_line(entry):
+                return "格式无效，请使用：/方舟 别名 添加 <外号> <干员名> [简短定位]"
+            # 去重同名外号
+            new_list = [x for x in rt_list if (parse_custom_alias_line(x) or ("", "", ""))[0].lower() != alias.lower()]
+            new_list.append(entry)
+            save_runtime_aliases(rt_path, new_list)
+            self._rebuild_matcher()
+            return f"已添加自定义黑话：「{alias}」→「{target}」，已立即生效。"
+
+        if sub in ("删除", "del", "rm", "remove") and len(args) >= 2:
+            alias = args[1].strip().lower()
+            new_list = [x for x in rt_list if (parse_custom_alias_line(x) or ("", "", ""))[0].lower() != alias]
+            if len(new_list) == len(rt_list):
+                return f"未在热添加列表中找到外号「{args[1]}」（若在设置页配置请前往插件设置删除）。"
+            save_runtime_aliases(rt_path, new_list)
+            self._rebuild_matcher()
+            return f"已删除自定义黑话「{args[1]}」，已立即生效。"
+
+        return "用法：/方舟 别名 列表 | /方舟 别名 添加 <外号> <干员名> [定位] | /方舟 别名 删除 <外号>"
+
+    @Command(
         name="ak_wiki_cmd",
-        description="快捷查询明日方舟 PRTS Wiki：/方舟 <干员/词条> [技能|模组|材料|档案] 或 /方舟 清理缓存",
-        pattern=r"^/(?:方舟|prts|ark)(?:\s+.*)?$",
+        description="快捷查询明日方舟 PRTS Wiki：/方舟 <干员/词条> [技能|模组|材料|总计|语音|档案] 或 /方舟 活动/公招/别名/帮助/缓存",
+        pattern=_RE_WIKI_COMMAND.pattern,
     )
     async def cmd_wiki(self, **kwargs: Any) -> tuple[bool, str, int]:
         if not self._is_enabled() or not self.cfg.commands.enable_commands or not self._prts or not self.ctx:
             return False, "", 0
-        stream_id, gid, uid = self._extract_stream_and_ids(kwargs)
-        if not stream_id or not self._scope_allowed(group_id=gid, user_id=uid):
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        if not stream_id:
+            return False, "", 0
+        allowed, plat = await self._scope_allowed_async(stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
             return False, "", 0
 
-        raw_text = str(kwargs.get("matched_text") or kwargs.get("text") or "").strip()
-        if not raw_text and isinstance(kwargs.get("message"), dict):
-            raw_text = str(kwargs["message"].get("processed_plain_text") or kwargs["message"].get("raw_message") or "").strip()
+        arg_str = _command_args(kwargs, _RE_WIKI_COMMAND)
+        low_arg = arg_str.lower()
 
-        arg_str = re.sub(r"^/(?:方舟|prts|ark)\s*", "", raw_text, flags=re.I).strip()
-        if not arg_str:
-            help_msg = (
-                "【明日方舟wiki插件 · 快捷指令】\n"
-                "• /方舟 <干员/外号/词条> [总览|技能|模组|材料|档案]\n"
-                "• /立绘 <干员/外号> [精二|初始|皮肤1|皮肤名|列表]\n"
-                "• /方舟 缓存  （查看本地缓存占用）\n"
-                "• /方舟 清理缓存  （清空本地缓存，群聊仅限管理员）"
-            )
-            await self.ctx.send.text(help_msg, stream_id=stream_id)
-            return True, "已显示帮助菜单", 2
+        if not arg_str or low_arg in ("帮助", "help", "指令", "菜单"):
+            return await self._send_help_card_or_text(stream_id, platform=plat)
 
         # 缓存查看与一键清理（清理缓存需管理员校验）
-        low_arg = arg_str.lower()
         if low_arg in ("清理缓存", "清缓存", "清除缓存", "clear", "clean", "clearcache"):
-            if not await self._can_clear_cache(group_id=gid, user_id=uid):
+            if not await self._can_clear_cache(group_id=gid, user_id=uid, platform=plat, private=_is_private_command(kwargs)):
                 msg = "仅插件管理员可在群聊中执行清理缓存（可在插件配置 commands.admin_users 中添加管理员 ID）。"
-                await self.ctx.send.text(msg, stream_id=stream_id)
-                return True, msg, 2
+                return await self._command_reply(stream_id, msg, msg, platform=plat)
             import asyncio
             self._prts.clear_memory_cache()
             self._recent_cards.clear()
+            self._card_png.clear()
+            self._help_png.clear()
             if self._store:
                 p_cnt, i_cnt, freed_mb = await asyncio.to_thread(self._store.clear_all)
                 msg = f"缓存已清空：移除 {p_cnt} 条词条缓存、{i_cnt} 张图片缓存（释放 {freed_mb} MB）。"
             else:
                 msg = "内存缓存已清空。"
-            await self.ctx.send.text(msg, stream_id=stream_id)
-            return True, msg, 2
+            return await self._command_reply(stream_id, msg, msg, platform=plat)
 
         if low_arg in ("缓存", "缓存状态", "cache", "stats"):
             import asyncio
@@ -848,16 +1246,62 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 )
             else:
                 msg = "缓存仓库未初始化。"
-            await self.ctx.send.text(msg, stream_id=stream_id)
-            return True, msg, 2
+            return await self._command_reply(stream_id, msg, msg, platform=plat)
+
+        if low_arg in ("活动", "当期活动", "卡池", "寻访", "events", "event"):
+            try:
+                reply = await self._prts.query_current_events()
+            except Exception as exc:
+                reply = f"查询当期活动失败：{_exc_text(exc)}"
+            return await self._command_reply(stream_id, reply, "已发送当期活动与卡池", platform=plat)
 
         parts = arg_str.split()
+        p0 = parts[0].lower()
+
+        if p0 in ("别名", "黑话", "昵称", "alias"):
+            msg = await self._handle_alias_subcmd(
+                parts[1:], gid=gid, uid=uid, platform=plat, private=_is_private_command(kwargs),
+            )
+            return await self._command_reply(stream_id, msg, "已处理别名管理", platform=plat)
+
+        if p0 in ("公招", "公开招募", "recruit"):
+            tags = [t for t in re.split(r"[\s,，/、+]+", " ".join(parts[1:])) if t]
+            try:
+                reply = await self._prts.calculate_recruit(tags)
+            except Exception as exc:
+                reply = f"公招计算失败：{_exc_text(exc)}"
+            return await self._command_reply(stream_id, reply, "已发送公招计算结果", platform=plat)
+
+        if p0 in ("总计", "汇总", "总账", "缺口", "summary") and len(parts) >= 2:
+            try:
+                reply = await self._prts.query_material_summary(parts[1], detail=" ".join(parts[2:]))
+            except Exception as exc:
+                reply = f"计算材料总账失败：{_exc_text(exc)}"
+            return await self._command_reply(stream_id, reply, "已发送材料总账", platform=plat)
+
+        if p0 in ("语音", "台词", "voice") and len(parts) >= 2:
+            try:
+                reply = await self._prts.query_voice_lines(parts[1], keyword=" ".join(parts[2:]))
+            except Exception as exc:
+                reply = f"查询干员语音失败：{_exc_text(exc)}"
+            return await self._command_reply(stream_id, reply, "已发送干员语音台词", platform=plat)
+
+        # 只打了子命令、没带干员：直接给用法，别掉到词条检索里回一句「没找到『总计』」
+        if p0 in ("总计", "汇总", "总账", "缺口", "summary"):
+            msg = "用法：/方舟 总计 <干员> [精二|一二三技能|模组]，例：/方舟 总计 维什戴尔 精二 三技能"
+            return await self._command_reply(stream_id, msg, "已提示材料总账用法", platform=plat)
+        if p0 in ("语音", "台词", "voice"):
+            msg = "用法：/方舟 语音 <干员> [戳一戳|信赖|交谈|随机]，例：/方舟 语音 叔叔 戳一戳"
+            return await self._command_reply(stream_id, msg, "已提示语音用法", platform=plat)
+
         target = parts[0]
         section_map = {
             "总览": "overview", "基础": "overview", "面板": "overview",
             "技能": "skills", "专精": "skills",
             "模组": "modules",
             "材料": "materials", "升级": "materials", "精二": "materials",
+            "总计": "summary", "汇总": "summary", "总账": "summary",
+            "语音": "voice", "台词": "voice",
             "档案": "lore", "故事": "lore", "剧情": "lore",
             "wiki": "wiki", "词条": "wiki",
         }
@@ -867,18 +1311,20 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             p2 = parts[1].lower()
             if p2 in section_map:
                 section = section_map[p2]
-                detail = " ".join(parts[2:])
+                # 「精二」同时指定材料板块和筛选阶段。
+                detail = " ".join(parts[1:] if p2 == "精二" else parts[2:])
             else:
                 detail = " ".join(parts[1:])
 
-        # 对干员总览/技能/模组/材料优先发 2x 高清工业风卡片图；不可用或非干员自动无缝降级纯文本
-        if section in ("overview", "skills", "modules", "materials"):
+        # 对干员总览/技能/模组/材料优先发 2x 高清黑曜石金箔风格卡片图；不可用或非干员自动无缝降级纯文本
+        if section in ("overview", "skills", "modules", "materials") and not self._platform_no_image(plat):
             sent_card, op_name = await self._render_and_send_card(
                 stream_id=stream_id,
                 target=target,
                 section=section,
                 detail=detail,
                 dedup_seconds=0.0,
+                platform=plat,
             )
             if sent_card:
                 return True, f"已发送 {op_name or target} 战术卡片图", 2
@@ -886,30 +1332,28 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         try:
             reply = await self._prts.query_wiki(target=target, section=section, detail=detail)
         except Exception as exc:
-            reply = f"查询 PRTS Wiki 失败：{exc}"
-        await self.ctx.send.text(reply, stream_id=stream_id)
-        return True, "已发送 Wiki 查询结果", 2
+            reply = f"查询 PRTS Wiki 失败：{_exc_text(exc)}"
+        return await self._command_reply(stream_id, reply, "已发送 Wiki 查询结果", platform=plat)
 
     @Command(
         name="ak_illust_cmd",
         description="快捷发送明日方舟干员立绘：/立绘 <干员/外号> [精二|初始|皮肤1|皮肤名|列表]",
-        pattern=r"^/(?:立绘|方舟立绘|ak图)(?:\s+.*)?$",
+        pattern=_RE_ILLUSTRATION_COMMAND.pattern,
     )
     async def cmd_illustration(self, **kwargs: Any) -> tuple[bool, str, int]:
         if not self._is_enabled() or not self.cfg.commands.enable_commands or not self._prts or not self.ctx:
             return False, "", 0
-        stream_id, gid, uid = self._extract_stream_and_ids(kwargs)
-        if not stream_id or not self._scope_allowed(group_id=gid, user_id=uid):
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        if not stream_id:
+            return False, "", 0
+        allowed, plat = await self._scope_allowed_async(stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs))
+        if not allowed:
             return False, "", 0
 
-        raw_text = str(kwargs.get("matched_text") or kwargs.get("text") or "").strip()
-        if not raw_text and isinstance(kwargs.get("message"), dict):
-            raw_text = str(kwargs["message"].get("processed_plain_text") or kwargs["message"].get("raw_message") or "").strip()
-
-        arg_str = re.sub(r"^/(?:立绘|方舟立绘|ak图)\s*", "", raw_text, flags=re.I).strip()
+        arg_str = _command_args(kwargs, _RE_ILLUSTRATION_COMMAND)
         if not arg_str:
-            await self.ctx.send.text("用法：/立绘 <干员名或外号> [精二|初始|皮肤1|皮肤名|列表]", stream_id=stream_id)
-            return True, "已提示立绘指令用法", 2
+            usage = "用法：/立绘 <干员名或外号> [精二|初始|皮肤1|皮肤名|列表]"
+            return await self._command_reply(stream_id, usage, "已提示立绘指令用法", platform=plat)
 
         parts = arg_str.split(maxsplit=1)
         operator = parts[0]
@@ -918,27 +1362,36 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         try:
             res = await self._prts.fetch_illustration(operator, variant)
         except Exception as exc:
-            await self.ctx.send.text(f"获取立绘失败：{exc}", stream_id=stream_id)
-            return True, "获取立绘失败", 2
+            # 超时类异常常常没有消息文本，日志里带上类型与 repr 便于事后定位
+            if self.ctx:
+                self.ctx.logger.warning(
+                    f"[明日方舟wiki插件] 立绘获取异常（干员={operator} 版本={variant}）: "
+                    f"{type(exc).__name__} {exc!r}"
+                )
+            return await self._command_reply(stream_id, f"获取立绘失败：{_exc_text(exc)}", "获取立绘失败", platform=plat)
 
         if not res.ok:
-            await self.ctx.send.text(res.error or "获取立绘失败。", stream_id=stream_id)
-            return True, "获取立绘失败", 2
+            return await self._command_reply(stream_id, res.error or "获取立绘失败。", "获取立绘失败", platform=plat)
 
         if res.label == "列表" or not res.image_bytes:
             avail = "\n".join(f"• {x}" for x in (res.available_variants or []))
-            await self.ctx.send.text(f"【{res.operator} · 可选立绘】\n{avail}", stream_id=stream_id)
-            return True, "已列出可选立绘", 2
+            tip = f"\n发「/立绘 {res.operator} 皮肤1」或「/立绘 {res.operator} 初始」即可查看"
+            return await self._command_reply(
+                stream_id, f"【{res.operator} · 可选立绘】\n{avail}{tip}", "已列出可选立绘", platform=plat,
+            )
 
-        img_b64 = base64.b64encode(res.image_bytes).decode("ascii")
-        try:
-            ok = _send_ok(await self.ctx.send.image(img_b64, stream_id=stream_id))
-            if not ok:
-                msg = f"当前平台暂不支持直发图片，可查看：{res.source_url}" if res.source_url else "图片发送失败。"
-                await self.ctx.send.text(msg, stream_id=stream_id)
-        except Exception as exc:
-            await self.ctx.send.text(f"图片发送异常：{exc}", stream_id=stream_id)
-        return True, f"已发送 {res.operator} 立绘", 2
+        if not self._platform_no_image(plat):
+            img_b64 = base64.b64encode(res.image_bytes).decode("ascii")
+            try:
+                if _send_ok(await self.ctx.send.image(img_b64, stream_id=stream_id)):
+                    return True, f"已发送 {res.operator} 立绘", 2
+            except Exception as exc:
+                self.ctx.logger.warning(f"[明日方舟wiki插件] 发送立绘异常（{type(exc).__name__}）: {exc!r}")
+
+        msg = f"当前会话未能直发「{res.operator}」{res.label}图片。"
+        if res.source_url:
+            msg += f" 可查看 PRTS 图源：{res.source_url}"
+        return await self._command_reply(stream_id, msg, f"已降级提示 {res.operator} 立绘", platform=plat)
 
 
 def create_plugin() -> ArknightsWikiPlugin:
