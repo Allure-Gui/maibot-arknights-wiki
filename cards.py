@@ -529,17 +529,17 @@ async def build_enemy_card_html(
     ]
 
     if en.get("ability"):
-        ab_lines = [ln.strip() for ln in en["ability"].splitlines() if ln.strip()]
-        ab_html = "".join(f"<div class='kv'>{_esc(ln)}</div>" for ln in ab_lines[:10])
+        ab_lines = [ln.strip().lstrip("·•- ").strip() for ln in en["ability"].splitlines() if ln.strip()]
+        ab_html = "".join(f"<div class='kv'>· {_esc(ln)}</div>" for ln in ab_lines[:10])
         parts.append(_sec("02", "核心特性与姿态", "MECHANICS", ab_html))
 
     sk_cards: list[str] = []
     for sk in (en.get("skills") or [])[:5]:
         sp_pills = []
         if sk.get("init_sp") and sk["init_sp"] != "9999":
-            sp_pills.append(f"<span class='p s'>初{sk['init_sp']}</span>")
+            sp_pills.append(f"<span class='p s'>初 {sk['init_sp']}</span>")
         if sk.get("cost_sp") and sk["cost_sp"] != "9999":
-            sp_pills.append(f"<span class='p s'>消{sk['cost_sp']}</span>")
+            sp_pills.append(f"<span class='p s'>消 {sk['cost_sp']}</span>")
         sk_cards.append(
             f"<div class='sk'><div class='sh'><span class='sn'>{_esc(sk['name'])}</span>"
             f"<div class='sp'>{''.join(sp_pills)}</div></div>"
