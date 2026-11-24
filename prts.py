@@ -51,6 +51,68 @@ _RE_TABLE_CELL_SPLIT = re.compile(r"\|\||!!|\||!")
 _RE_CATEGORY_LINE = re.compile(r"^[ \t]*分类[:：].*$", re.M)
 
 
+RECRUIT_TAG_ALIAS: dict[str, str] = {
+    "高资": "高级资深干员", "高级资深": "高级资深干员",
+    "资深": "资深干员",
+    "机械": "支援机械", "小车": "支援机械",
+    "高台": "远程位", "远程": "远程位",
+    "地面": "近战位", "近战": "近战位",
+    "狙击": "狙击干员", "术师": "术师干员", "近卫": "近卫干员",
+    "先锋": "先锋干员", "重装": "重装干员", "医疗": "医疗干员",
+    "辅助": "辅助干员", "特种": "特种干员",
+    "回费": "费用回复", "快活": "快速复活",
+}
+
+RECRUIT_CANONICAL_TAGS: tuple[str, ...] = (
+    "高级资深干员", "资深干员", "支援机械", "费用回复", "快速复活",
+    "先锋干员", "狙击干员", "医疗干员", "术师干员", "近卫干员", "重装干员", "辅助干员", "特种干员",
+    "近战位", "远程位",
+    "新手", "治疗", "支援", "输出", "群攻", "减速", "生存", "防护", "削弱", "位移", "控场", "爆发", "召唤", "元素",
+)
+
+_RECRUIT_SCAN_WORDS: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        [(t, t) for t in RECRUIT_CANONICAL_TAGS]
+        + [(k, v) for k, v in RECRUIT_TAG_ALIAS.items() if len(k) >= 2],
+        key=lambda kv: len(kv[0]),
+        reverse=True,
+    )
+)
+
+_RECRUIT_SCENE_HINTS: tuple[str, ...] = (
+    "公开招募", "招募时限", "职业需求", "招募预算", "人脉资源", "公招", "高资", "高级资深干员", "资深干员",
+)
+
+
+def extract_recruit_tags_from_text(text: str) -> list[str]:
+    """从自然语言或 MaiBot 图片识别描述中精确提取公招官方词条（按词长降序，防「高级资深干员」误拆出「资深干员」）。"""
+    s = str(text or "")
+    if not s:
+        return []
+    found: list[str] = []
+    masked = s
+    for raw_w, canon in _RECRUIT_SCAN_WORDS:
+        if raw_w in masked:
+            if canon not in found:
+                found.append(canon)
+            # 用占位符抹掉已匹配片段，避免子串重复命中（如 高级资深干员 -> 资深干员）
+            masked = masked.replace(raw_w, " ")
+            if len(found) >= 6:
+                break
+    return found
+
+
+def detect_recruit_screenshot_tags(recent_texts: list[str]) -> list[str]:
+    """检测最新用户消息/识图描述是否为公招截图或公招咨询，满足条件时返回提取到的词条列表。"""
+    if not recent_texts:
+        return []
+    latest = str(recent_texts[-1] or "")
+    if not any(h in latest for h in _RECRUIT_SCENE_HINTS):
+        return []
+    tags = extract_recruit_tags_from_text(latest)
+    return tags if len(tags) >= 2 else []
+
+
 @dataclass(slots=True)
 class IllustrationResult:
     """立绘获取结果。"""
@@ -500,6 +562,8 @@ class PRTSClient:
         sec = (section or "overview").strip().lower()
         if sec in ("events", "event", "活动", "卡池", "寻访"):
             return await self.query_current_events()
+        if sec in ("enemy", "boss", "敌人", "领袖"):
+            return await self.query_enemy(target, detail=detail)
         if sec in ("voice", "voices", "语音", "台词"):
             return await self.query_voice_lines(target, keyword=detail)
         if sec in ("summary", "total", "总计", "汇总", "总账"):
@@ -1531,95 +1595,206 @@ class PRTSClient:
             out.append(f"• {lbl}：「{txt}」")
         return "\n".join(out)
 
-    async def query_current_events(self) -> str:
-        """通过 PRTS Semantic MediaWiki ask 接口速查国服当前活动与寻访卡池（6 小时缓存）。"""
+    async def get_current_events_struct(self) -> dict[str, Any]:
+        """通过 PRTS Semantic MediaWiki ask 接口获取国服当前活动与寻访卡池结构化数据（2 小时缓存，倒计时实时计算）。"""
         import datetime
-
-        cache_title = "__prts_current_events_v1__"
-        cached = await asyncio.to_thread(self.store.get_page, cache_title, 6 * 3600.0)
-        if cached:
-            return cached[0]
 
         tz_cn = datetime.timezone(datetime.timedelta(hours=8))
         now_dt = datetime.datetime.now(tz_cn)
-        now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
         now_ts = int(now_dt.timestamp())
 
-        q_events = (
-            f"[[分类:有活动信息的页面]][[活动结束时间::>{now_iso}]]"
-            "|?名称缩短|?活动开始时间|?活动结束时间|sort=活动开始时间|order=desc|limit=10"
-        )
-        q_gacha = (
-            f"[[分类:国服寻访]][[寻访关闭时间cn::>{now_iso}]]"
-            "|?寻访名cn|?卡池名|?寻访开启时间cn|?寻访关闭时间cn|sort=寻访开启时间cn|order=desc|limit=8"
-        )
+        cache_title = "__prts_current_events_struct_v1__"
+        raw_struct: Optional[dict[str, Any]] = None
+        cached = await asyncio.to_thread(self.store.get_page, cache_title, 2 * 3600.0)
+        if cached:
+            try:
+                parsed = json.loads(cached[0])
+                if isinstance(parsed, dict) and ("gachas" in parsed or "events" in parsed):
+                    raw_struct = parsed
+            except Exception:
+                raw_struct = None
 
-        ev_res, ga_res = await asyncio.gather(
-            self._api({"action": "ask", "query": q_events}),
-            self._api({"action": "ask", "query": q_gacha}),
-            return_exceptions=True,
-        )
+        if raw_struct is None:
+            now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            q_events = (
+                f"[[分类:有活动信息的页面]][[活动结束时间::>{now_iso}]]"
+                "|?名称缩短|?标题图文件名|?活动开始时间|?活动结束时间|sort=活动开始时间|order=desc|limit=12"
+            )
+            q_gacha = (
+                f"[[分类:国服寻访]][[寻访关闭时间cn::>{now_iso}]]"
+                "|?寻访名cn|?卡池名|?寻访开启时间cn|?寻访关闭时间cn|sort=寻访开启时间cn|order=desc|limit=10"
+            )
+            ev_res, ga_res = await asyncio.gather(
+                self._api({"action": "ask", "query": q_events}),
+                self._api({"action": "ask", "query": q_gacha}),
+                return_exceptions=True,
+            )
 
-        def _fmt_remain(start_ts: int, end_ts: int) -> str:
-            if start_ts > now_ts:
-                diff = start_ts - now_ts
-                d, h = divmod(diff // 3600, 24)
-                return f"{d}天{h}小时后开启" if d else f"{h}小时后开启"
-            diff = max(0, end_ts - now_ts)
-            d, h = divmod(diff // 3600, 24)
-            if d > 180:
-                return "长期常驻"
-            return f"剩余{d}天{h}小时" if d else f"剩余{h}小时"
+            def _extract_ts(arr: Any) -> int:
+                if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                    try:
+                        return int(arr[0].get("timestamp") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                return 0
 
-        def _extract_ts(arr: Any) -> int:
-            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-                try:
-                    return int(arr[0].get("timestamp") or 0)
-                except (TypeError, ValueError):
-                    return 0
-            return 0
+            def _clean_file(raw_name: str) -> str:
+                s = str(raw_name or "").strip()
+                if s.startswith("文件:"):
+                    s = s[3:].strip()
+                elif s.lower().startswith("file:"):
+                    s = s[5:].strip()
+                return s
 
-        lines = [f"【明日方舟国服 · 当期活动与卡池】（{now_dt.strftime('%m-%d %H:%M')}）"]
+            raw_gachas: list[dict[str, Any]] = []
+            if isinstance(ga_res, dict):
+                results = ga_res.get("query", {}).get("results") or {}
+                if isinstance(results, dict):
+                    for title, obj in results.items():
+                        po = obj.get("printouts") or {}
+                        name = str((po.get("寻访名cn") or [title])[0]).strip()
+                        if name.startswith("文件:"):
+                            name = name[3:].rsplit(".", 1)[0]
+                        st_ts = _extract_ts(po.get("寻访开启时间cn"))
+                        ed_ts = _extract_ts(po.get("寻访关闭时间cn"))
+                        if st_ts and st_ts - now_ts > 14 * 86400:
+                            continue
+                        raw_gachas.append({
+                            "name": name,
+                            "banner": _clean_file(title),
+                            "start_ts": st_ts,
+                            "end_ts": ed_ts,
+                        })
 
-        ev_items: list[str] = []
-        if isinstance(ev_res, dict):
-            results = ev_res.get("query", {}).get("results") or {}
-            if isinstance(results, dict):
-                for title, obj in results.items():
-                    po = obj.get("printouts") or {}
-                    name = (po.get("名称缩短") or [title])[0]
-                    st_ts = _extract_ts(po.get("活动开始时间"))
-                    ed_ts = _extract_ts(po.get("活动结束时间"))
-                    if st_ts and st_ts - now_ts > 14 * 86400:
-                        continue
-                    ev_items.append(f"• {name}（{_fmt_remain(st_ts, ed_ts)}）")
-        if ev_items:
-            lines.append("▸ 活动：")
-            lines.extend(ev_items[:6])
+            raw_events: list[dict[str, Any]] = []
+            if isinstance(ev_res, dict):
+                results = ev_res.get("query", {}).get("results") or {}
+                if isinstance(results, dict):
+                    for title, obj in results.items():
+                        po = obj.get("printouts") or {}
+                        name = str((po.get("名称缩短") or [title])[0]).strip()
+                        banner = _clean_file(str((po.get("标题图文件名") or [""])[0]))
+                        st_ts = _extract_ts(po.get("活动开始时间"))
+                        ed_ts = _extract_ts(po.get("活动结束时间"))
+                        if st_ts and st_ts - now_ts > 14 * 86400:
+                            continue
+                        raw_events.append({
+                            "name": name,
+                            "banner": banner,
+                            "start_ts": st_ts,
+                            "end_ts": ed_ts,
+                        })
 
-        ga_items: list[str] = []
-        if isinstance(ga_res, dict):
-            results = ga_res.get("query", {}).get("results") or {}
-            if isinstance(results, dict):
-                for title, obj in results.items():
-                    po = obj.get("printouts") or {}
-                    name = (po.get("寻访名cn") or [title])[0]
-                    st_ts = _extract_ts(po.get("寻访开启时间cn"))
-                    ed_ts = _extract_ts(po.get("寻访关闭时间cn"))
-                    if st_ts and st_ts - now_ts > 14 * 86400:
-                        continue
-                    ga_items.append(f"• {name}（{_fmt_remain(st_ts, ed_ts)}）")
-        if ga_items:
-            lines.append("▸ 寻访卡池：")
-            lines.extend(ga_items[:5])
+            raw_struct = {"gachas": raw_gachas, "events": raw_events}
+            if raw_gachas or raw_events:
+                await asyncio.to_thread(
+                    self.store.put_page,
+                    cache_title,
+                    json.dumps(raw_struct, ensure_ascii=False),
+                    False,
+                )
 
-        if not ev_items and not ga_items:
+        def _enrich(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            for it in items:
+                st_ts = int(it.get("start_ts") or 0)
+                ed_ts = int(it.get("end_ts") or 0)
+                if ed_ts and ed_ts <= now_ts:
+                    continue
+                is_soon = bool(st_ts and st_ts > now_ts)
+                diff = (st_ts - now_ts) if is_soon else max(0, ed_ts - now_ts)
+                days, hours = divmod(diff // 3600, 24)
+                is_long = (not is_soon) and (days > 180)
+                if is_soon:
+                    remain = f"{days}天{hours}小时后开启" if days else f"{max(1, hours)}小时后开启"
+                    status = "soon"
+                elif is_long:
+                    remain = "长期常驻"
+                    status = "long"
+                else:
+                    remain = f"剩余 {days}天 {hours}时" if days else f"剩余 {max(1, hours)}小时"
+                    status = "urgent" if days <= 2 else "live"
+
+                if st_ts and ed_ts and not is_long:
+                    st_s = datetime.datetime.fromtimestamp(st_ts, tz_cn).strftime("%m.%d %H:%M")
+                    ed_s = datetime.datetime.fromtimestamp(ed_ts, tz_cn).strftime("%m.%d %H:%M")
+                    period = f"{st_s} — {ed_s}"
+                elif is_long and st_ts:
+                    st_s = datetime.datetime.fromtimestamp(st_ts, tz_cn).strftime("%Y.%m.%d")
+                    period = f"{st_s} 起常驻开放"
+                else:
+                    period = ""
+
+                # 进度条百分比（仅限时进行中有效）
+                pct = 0
+                if not is_soon and not is_long and st_ts and ed_ts and ed_ts > st_ts:
+                    pct = max(4, min(98, int((now_ts - st_ts) * 100 / (ed_ts - st_ts))))
+
+                out.append({
+                    "name": str(it.get("name") or ""),
+                    "banner": str(it.get("banner") or ""),
+                    "start_ts": st_ts,
+                    "end_ts": ed_ts,
+                    "is_soon": is_soon,
+                    "is_long": is_long,
+                    "status": status,
+                    "remain": remain,
+                    "period": period,
+                    "pct": pct,
+                })
+            # 排序：进行中限时（最新开启优先）> 即将开启 > 长期常驻
+            out.sort(key=lambda x: (1 if x["is_soon"] else (2 if x["is_long"] else 0), -x["start_ts"]))
+            return out
+
+        return {
+            "updated_at": now_dt.strftime("%Y-%m-%d %H:%M"),
+            "gachas": _enrich(raw_struct.get("gachas") or []),
+            "events": _enrich(raw_struct.get("events") or []),
+        }
+
+    def format_current_events_text(self, data: dict[str, Any], *, focus: str = "events") -> str:
+        """将当期活动与卡池结构化数据格式化为纯文本（降级兜底或无图平台使用）。"""
+        gachas = data.get("gachas") or []
+        events = data.get("events") or []
+        stamp = data.get("updated_at") or ""
+        if focus == "gacha":
+            if not gachas:
+                return "暂未从 PRTS 获取到当期寻访卡池信息，请稍后再试。"
+            lines = [f"【明日方舟国服 · 当期寻访卡池】（{stamp}）"]
+            for g in gachas[:6]:
+                p = f" | {g['period']}" if g.get("period") else ""
+                lines.append(f"• {g['name']}（{g['remain']}{p}）")
+            lines.append("来源：PRTS Wiki (CC BY-NC-SA 4.0)")
+            return "\n".join(lines)
+
+        if focus == "events":
+            if not events:
+                return "暂未从 PRTS 获取到当期活动信息，请稍后再试。"
+            lines = [f"【明日方舟国服 · 当期活动】（{stamp}）"]
+            for e in events[:6]:
+                p = f" | {e['period']}" if e.get("period") else ""
+                lines.append(f"• {e['name']}（{e['remain']}{p}）")
+            lines.append("来源：PRTS Wiki (CC BY-NC-SA 4.0)")
+            return "\n".join(lines)
+
+        if not gachas and not events:
             return "暂未从 PRTS 获取到当期活动信息，请稍后再试。"
-
+        lines = [f"【明日方舟国服 · 当期活动与卡池】（{stamp}）"]
+        if gachas:
+            lines.append("▸ 寻访卡池：")
+            for g in gachas[:5]:
+                lines.append(f"• {g['name']}（{g['remain']}）")
+        if events:
+            lines.append("▸ 当期活动：")
+            for e in events[:6]:
+                lines.append(f"• {e['name']}（{e['remain']}）")
         lines.append("来源：PRTS Wiki (CC BY-NC-SA 4.0)")
-        text = "\n".join(lines)
-        await asyncio.to_thread(self.store.put_page, cache_title, text, False)
-        return text
+        return "\n".join(lines)
+
+    async def query_current_events(self, *, focus: str = "events") -> str:
+        """通过 PRTS Semantic MediaWiki ask 接口速查国服当前活动或寻访卡池。"""
+        data = await self.get_current_events_struct()
+        return self.format_current_events_text(data, focus=focus)
 
     async def _get_recruit_pool(self) -> list[dict[str, Any]]:
         """按需从 PRTS 干员一览拉取最新公开招募干员池并缓存 7 天（仅约 15 KB JSON）。"""
@@ -1675,8 +1850,8 @@ class PRTSClient:
             await asyncio.to_thread(self.store.put_page, cache_title, json.dumps(pool, ensure_ascii=False), False)
         return pool
 
-    async def calculate_recruit(self, raw_tags: list[str]) -> str:
-        """毫秒级公开招募 Tag 保底组合计算器（支持常见简写）。"""
+    async def calculate_recruit_struct(self, raw_tags: list[str]) -> dict[str, Any]:
+        """毫秒级公开招募保底组合计算器（结构化返回，供卡片图渲染与纯文本降级共用）。"""
         from itertools import combinations
 
         tag_alias = {
@@ -1703,14 +1878,14 @@ class PRTSClient:
             if mapped not in norm_tags:
                 norm_tags.append(mapped)
         if not norm_tags:
-            return "请提供公招词条，例：/公招 资深 狙击 削弱 爆发 生存"
+            return {"ok": False, "tags": [], "combos": [], "error": "请提供公招词条，例：/公招 资深 狙击 削弱 爆发 生存"}
         norm_tags = norm_tags[:6]
 
         pool = await self._get_recruit_pool()
         if not pool:
-            return "暂未能拉取 PRTS 公招池数据，请稍后再试。"
+            return {"ok": False, "tags": norm_tags, "combos": [], "error": "暂未能拉取 PRTS 公招池数据，请稍后再试。"}
 
-        combos: list[tuple[int, int, tuple[str, ...], list[dict[str, Any]]]] = []
+        combos: list[dict[str, Any]] = []
         for r in range(1, min(4, len(norm_tags)) + 1):
             for comb in combinations(norm_tags, r):
                 has_top = "高级资深干员" in comb
@@ -1720,30 +1895,211 @@ class PRTSClient:
                 ]
                 if not matched:
                     continue
-                # 计算保底最低星级（1★ 支援机械在 9 小时招募会被排除，除非带支援机械词条）
+                # 1★ 支援机械在 9 小时招募会被排除，除非带「支援机械」词条或全池仅 1★
                 non_1 = [op["rarity"] for op in matched if op["rarity"] >= 2]
-                if "支援机械" in comb:
-                    min_r = 1
-                    score = 45  # 1★ 必出小车高亮
-                elif not non_1:
+                is_robot = "支援机械" in comb or not non_1
+                if is_robot:
                     min_r = 1
                     score = 45
                 else:
                     min_r = min(non_1)
                     score = min_r * 10
-                if min_r >= 4 or "支援机械" in comb:
+                if min_r >= 4 or is_robot:
                     matched_sorted = sorted(matched, key=lambda x: (-x["rarity"], x["name"]))
-                    combos.append((score, min_r, comb, matched_sorted))
+                    combos.append({
+                        "tags": list(comb),
+                        "min_rarity": min_r,
+                        "is_robot": is_robot,
+                        "score": score,
+                        "operators": [{"name": o["name"], "rarity": o["rarity"]} for o in matched_sorted],
+                    })
 
         if not combos:
-            return f"词条「{' / '.join(norm_tags)}」未找到必出 4★ 及以上或支援机械的保底组合（可按需刷新）。"
+            return {
+                "ok": False,
+                "tags": norm_tags,
+                "combos": [],
+                "error": f"词条「{' / '.join(norm_tags)}」未找到必出 4★ 及以上或支援机械的保底组合（可按需刷新）。",
+            }
 
-        combos.sort(key=lambda x: (-x[0], len(x[2]), len(x[3])))
+        # 同保底星级下，优先把人数更少、更精准的狙击组合排在前面
+        combos.sort(key=lambda x: (-x["score"], len(x["operators"]), len(x["tags"])))
+        return {"ok": True, "tags": norm_tags, "combos": combos[:12], "error": ""}
+
+    @staticmethod
+    def format_recruit_text(data: dict[str, Any]) -> str:
+        """将结构化公招计算结果格式化为紧凑纯文本（不支持发图平台或降级时使用）。"""
+        if not data.get("ok"):
+            return str(data.get("error") or "未找到高星保底组合。")
+        norm_tags = data.get("tags") or []
+        combos = data.get("combos") or []
         lines = [f"【公开招募保底组合】（{' / '.join(norm_tags)}）"]
-        for _, min_r, comb, ops in combos[:8]:
-            badge = "★1 支援机械" if "支援机械" in comb else f"保底{min_r}★"
+        for c in combos[:8]:
+            badge = "★1 支援机械" if c.get("is_robot") else f"保底{c['min_rarity']}★"
+            ops = c.get("operators") or []
             op_names = "、".join(f"{o['name']}({o['rarity']}★)" for o in ops[:6])
             if len(ops) > 6:
                 op_names += f" 等{len(ops)}人"
-            lines.append(f"• [{badge}] {' + '.join(comb)} → {op_names}")
+            lines.append(f"• [{badge}] {' + '.join(c['tags'])} → {op_names}")
         return "\n".join(lines)
+
+    async def calculate_recruit(self, raw_tags: list[str]) -> str:
+        """毫秒级公开招募 Tag 保底组合计算器（纯文本接口）。"""
+        data = await self.calculate_recruit_struct(raw_tags)
+        return self.format_recruit_text(data)
+
+    # --------------------------------------------------------
+    # BOSS / 敌人数值与机制解析（兼容干员同名自动跳转「xxx(敌方)」）
+    # --------------------------------------------------------
+
+    async def get_enemy_struct(self, target: str, detail: str = "") -> Optional[dict[str, Any]]:
+        """解析 PRTS 敌人/BOSS 结构化数值、控制抗性与技能机制。"""
+        q = str(target or "").strip()
+        if not q:
+            return None
+
+        wikitext = ""
+        title = ""
+
+        # 优先尝试解析标题；若命中干员页则自动尝试「xxx(敌方)」或搜索敌方词条
+        cand_titles: list[str] = []
+        resolved = await self.resolve_title(q)
+        if resolved:
+            cand_titles.append(resolved)
+        if not q.endswith("(敌方)"):
+            cand_titles.append(f"{q}(敌方)")
+        if resolved and not resolved.endswith("(敌方)") and f"{resolved}(敌方)" not in cand_titles:
+            cand_titles.append(f"{resolved}(敌方)")
+
+        for ct in cand_titles:
+            fetched = await self.fetch_wikitext(ct)
+            if not fetched:
+                continue
+            wt, _ = fetched
+            if "敌人信息/" in wt:
+                title, wikitext = ct, wt
+                break
+            # 页面里若有 {{参阅|xxx(敌方)|...}}，顺藤摸瓜跳到敌方页
+            ref_m = re.search(r"\{\{\s*参阅\s*\|\s*([^|}\n]+敌方[^|}\n]*)", wt)
+            if ref_m:
+                ref_title = ref_m.group(1).strip()
+                ref_fetched = await self.fetch_wikitext(ref_title)
+                if ref_fetched and "敌人信息/" in ref_fetched[0]:
+                    title, wikitext = ref_title, ref_fetched[0]
+                    break
+
+        if not wikitext:
+            # 模糊搜索带“敌方/领袖”兜底
+            sr = await self._api({"action": "query", "list": "search", "srsearch": f"{q} 敌人信息", "srlimit": 5})
+            for hit in sr.get("query", {}).get("search", []):
+                ht = str(hit.get("title") or "").strip()
+                if not ht:
+                    continue
+                fetched = await self.fetch_wikitext(ht)
+                if fetched and "敌人信息/" in fetched[0]:
+                    title, wikitext = ht, fetched[0]
+                    break
+
+        if not wikitext:
+            return None
+
+        common_tpls = extract_templates(wikitext, {"敌人信息/common2", "敌人信息/common"})
+        common = parse_template_params(common_tpls[0][1]) if common_tpls else {}
+        level_tpls = extract_templates(wikitext, {"敌人信息/levelcontent"})
+        levels = [parse_template_params(inner) for _, inner in level_tpls]
+
+        # 按 detail 选择级别（PRTS 为 0 起：级别0、级别1...；若用户输入超出最高档则自动取最高档，避免静默回退到级别0）
+        lv_idx = 0
+        lv_m = re.search(r"(\d+)", str(detail or ""))
+        if lv_m and levels:
+            want_lv = int(lv_m.group(1))
+            if want_lv >= len(levels):
+                lv_idx = len(levels) - 1
+            elif want_lv >= 0:
+                lv_idx = want_lv
+        lv = levels[lv_idx] if levels else {}
+
+        name = clean_wiki_text(common.get("名称") or lv.get("名称") or title).strip()
+        rank = clean_wiki_text(common.get("地位级别") or lv.get("地位") or "普通").strip()
+        resist_map = (
+            ("眩晕抗性", "眩晕"), ("沉默抗性", "沉默"), ("沉睡抗性", "沉睡"),
+            ("冻结抗性", "冻结"), ("浮空抗性", "浮空"), ("战栗抗性", "战栗"),
+            ("恐惧抗性", "恐惧"), ("麻痹抗性", "麻痹"), ("诱导抗性", "诱导"),
+            ("传送抗性", "传送"), ("缚地抗性", "缚地"),
+        )
+        immunities = [label for key, label in resist_map if str(lv.get(key) or "").strip() in ("有", "1", "true", "免疫")]
+
+        skills: list[dict[str, str]] = []
+        for i in range(0, 10):
+            sname = clean_wiki_text(lv.get(f"技能{i}", "")).replace("\n", " ").strip()
+            seff = clean_wiki_text(lv.get(f"技能{i}效果", "")).strip()
+            if sname or seff:
+                skills.append({
+                    "name": sname or f"技能 {i + 1}",
+                    "init_sp": str(lv.get(f"技能{i}初始") or "").strip(),
+                    "cost_sp": str(lv.get(f"技能{i}消耗") or "").strip(),
+                    "effect": seff,
+                })
+
+        ability_raw = common.get("能力") or common.get("能力修正") or ""
+        ability = clean_wiki_text(ability_raw).strip()
+        talent = clean_wiki_text(lv.get("天赋", "")).strip()
+
+        return {
+            "title": title,
+            "name": name,
+            "index": str(common.get("index") or "").strip(),
+            "rank": rank,
+            "race": clean_wiki_text(common.get("种类") or lv.get("种类") or "").strip(),
+            "damage_type": clean_wiki_text(common.get("伤害类型") or "").strip(),
+            "attack_mode": clean_wiki_text(common.get("攻击方式") or lv.get("攻击方式") or "").strip(),
+            "move_mode": clean_wiki_text(common.get("行动方式") or lv.get("行动方式") or "").strip(),
+            "event": clean_wiki_text(common.get("登场活动") or "").strip(),
+            "level_index": lv_idx,
+            "level_count": len(levels),
+            "stats": {
+                "hp": str(lv.get("最大生命值") or "-").strip(),
+                "atk": str(lv.get("攻击力") or "-").strip(),
+                "def": str(lv.get("防御力") or "-").strip(),
+                "res": str(lv.get("法术抗性") or "-").strip(),
+                "speed": str(lv.get("移动速度") or "").strip(),
+                "interval": str(lv.get("攻击间隔") or "").strip(),
+                "weight": str(lv.get("重量等级") or "").strip(),
+                "life_point": str(lv.get("数量") or "").strip(),
+                "elem_res": str(lv.get("元素抗性") or "").strip(),
+            },
+            "immunities": immunities,
+            "ability": ability,
+            "talent": talent,
+            "skills": skills,
+        }
+
+    @staticmethod
+    def format_enemy_text(en: dict[str, Any]) -> str:
+        """将敌人/BOSS 结构化数据格式化为紧凑纯文本。"""
+        st = en.get("stats") or {}
+        tags = [x for x in (en.get("rank"), en.get("race"), en.get("damage_type"), en.get("attack_mode"), en.get("move_mode")) if x]
+        lv_tip = f"（级别{en.get('level_index', 0)}，共{en.get('level_count', 1)}档）" if (en.get("level_count") or 0) > 1 else ""
+        lines = [
+            f"【{en['name']} · 敌方档案】{lv_tip}",
+            "定位：" + " / ".join(tags) if tags else "",
+            f"属性：生命 {st.get('hp','-')} | 攻击 {st.get('atk','-')} | 防御 {st.get('def','-')} | 法抗 {st.get('res','-')} | 攻速间隔 {st.get('interval','-')}s | 移速 {st.get('speed','-')} | 重量 {st.get('weight','-')}",
+            "控制免疫：" + ("、".join(en["immunities"]) if en.get("immunities") else "无常规异常免疫"),
+        ]
+        if en.get("ability"):
+            ab = en["ability"]
+            lines.append("核心机制：\n" + (ab[:420] + "…" if len(ab) > 420 else ab))
+        if en.get("skills"):
+            lines.append("主要技能：")
+            for sk in en["skills"][:4]:
+                eff = sk["effect"].replace("\n", " ")
+                lines.append(f"• {sk['name']}：{eff[:160]}{'…' if len(eff) > 160 else ''}")
+        lines.append("来源：PRTS Wiki (CC BY-NC-SA 4.0)")
+        return "\n".join(x for x in lines if x)
+
+    async def query_enemy(self, target: str, detail: str = "") -> str:
+        """查询敌人/BOSS 数值与机制（纯文本接口）。"""
+        en = await self.get_enemy_struct(target, detail=detail)
+        if not en:
+            return f"未在 PRTS Wiki 找到敌人或 BOSS「{target}」，请检查名称。"
+        return self.format_enemy_text(en)

@@ -25,14 +25,20 @@ from maibot_sdk import (
 from maibot_sdk.types import HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from pydantic import model_validator
 
-from .cards import build_help_card_html, build_operator_card_html
+from .cards import (
+    build_enemy_card_html,
+    build_events_card_html,
+    build_help_card_html,
+    build_operator_card_html,
+    build_recruit_card_html,
+)
 from .matcher import (
     ArknightsContextMatcher,
     load_runtime_aliases,
     parse_custom_alias_line,
     save_runtime_aliases,
 )
-from .prts import PRTSClient
+from .prts import PRTSClient, extract_recruit_tags_from_text
 
 PLUGIN_ID = "feiyu.arknights-wiki"
 _HINT_MARKER = "[方舟语境参考"
@@ -55,7 +61,7 @@ class PluginSection(PluginConfigBase):
         description="是否启用明日方舟wiki插件",
         json_schema_extra={"label": "启用插件"},
     )
-    config_version: str = Field(default="0.3.0", description="配置版本")
+    config_version: str = Field(default="0.3.1", description="配置版本")
 
 
 _LIST_MODE_MAP = {
@@ -204,7 +210,7 @@ class PRTSSection(PluginConfigBase):
         json_schema_extra={"label": "API 地址"},
     )
     user_agent: str = Field(
-        default="MaiBot-ArknightsWiki/0.3.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
+        default="MaiBot-ArknightsWiki/0.3.1 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
         description="礼貌 User-Agent（遵循 MediaWiki API 规范）",
         json_schema_extra={"label": "User-Agent"},
     )
@@ -262,12 +268,45 @@ class RenderSection(PluginConfigBase):
     )
 
 
+class ReminderSection(PluginConfigBase):
+    """活动与卡池即将结束时定时推送到允许的群聊（默认关闭，按需开启）。"""
+
+    __ui_label__ = "活动到期提醒"
+    __ui_icon__ = "bell"
+    __ui_order__ = 6
+
+    enable_event_reminder: bool = Field(
+        default=False,
+        description="开启后，在限时活动即将关闭时按设定时间（默认早上 9 点）自动推送到符合群聊黑/白名单的群聊",
+        json_schema_extra={"label": "开启活动到期提醒"},
+    )
+    reminder_hour: int = Field(
+        default=9,
+        ge=0,
+        le=23,
+        description="每日检查并推送到期提醒的小时（北京时间 0~23，默认早上 9 点）",
+        json_schema_extra={"label": "每日提醒时间（点）"},
+    )
+    remind_before_hours: int = Field(
+        default=24,
+        ge=6,
+        le=72,
+        description="距离活动结束不足多少小时时触发提醒（默认 24 小时内，每期活动每群仅提醒一次）",
+        json_schema_extra={"label": "提前提醒时长（小时）"},
+    )
+    include_gacha: bool = Field(
+        default=True,
+        description="开启后，即将结束的限时寻访卡池也会一并提醒",
+        json_schema_extra={"label": "同时提醒即将结束的卡池"},
+    )
+
+
 class CacheSection(PluginConfigBase):
     """本地 SQLite 文本与立绘 LRU 缓存配置。"""
 
     __ui_label__ = "本地缓存"
     __ui_icon__ = "database"
-    __ui_order__ = 6
+    __ui_order__ = 7
 
     page_ttl_hours: int = Field(
         default=168,
@@ -290,7 +329,7 @@ class GlossarySection(PluginConfigBase):
 
     __ui_label__ = "自定义黑话与昵称"
     __ui_icon__ = "tag"
-    __ui_order__ = 7
+    __ui_order__ = 8
 
     custom_aliases: list[str] = Field(
         default_factory=list,
@@ -315,6 +354,7 @@ class ArknightsWikiConfig(PluginConfigBase):
     commands: CommandSection = Field(default_factory=CommandSection)
     prts: PRTSSection = Field(default_factory=PRTSSection)
     render: RenderSection = Field(default_factory=RenderSection)
+    reminder: ReminderSection = Field(default_factory=ReminderSection)
     cache: CacheSection = Field(default_factory=CacheSection)
     glossary: GlossarySection = Field(default_factory=GlossarySection)
 
@@ -341,9 +381,10 @@ def _send_ok(res: Any) -> bool:
     return False
 
 
-_RE_RECRUIT_COMMAND = re.compile(r"^/(?:公招|公开招募|recruit)(?:\s+(?P<args>.*))?$")
-_RE_WIKI_COMMAND = re.compile(r"^/(?:方舟|prts|ark)(?:\s+(?P<args>.*))?$")
-_RE_ILLUSTRATION_COMMAND = re.compile(r"^/(?:立绘|方舟立绘|ak图)(?:\s+(?P<args>.*))?$")
+_RE_RECRUIT_COMMAND = re.compile(r"^/(?:公招|公开招募|recruit)(?:\s+(?P<args>.*))?$", re.I | re.S)
+_RE_WIKI_COMMAND = re.compile(r"^/(?:方舟|prts|ark)(?:\s+(?P<args>.*))?$", re.I | re.S)
+_RE_ILLUSTRATION_COMMAND = re.compile(r"^/(?:立绘|方舟立绘|ak图)(?:\s+(?P<args>.*))?$", re.I | re.S)
+_RE_MSG_PLACEHOLDER = re.compile(r"\[(?:图片|图|表情|回复|引用|CQ:[^\]]+)[^\]]*\]", re.I | re.S)
 
 
 def _command_args(kwargs: dict[str, Any], pattern: re.Pattern[str]) -> str:
@@ -501,6 +542,7 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         self._stream_meta_cache: dict[str, tuple[str, str, str, str]] = {}
         self._stream_meta_ts: float = 0.0
         self._no_image_platforms: set[str] = {"bot_console", "weixin", "wechat"}
+        self._reminder_task: Any = None
 
     @property
     def cfg(self) -> ArknightsWikiConfig:
@@ -558,6 +600,161 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             thumb_width=cfg.prts.illustration_thumb_width,
         )
 
+    def _stop_reminder_task(self) -> None:
+        task = self._reminder_task
+        self._reminder_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _start_reminder_task_if_needed(self) -> None:
+        import asyncio
+
+        self._stop_reminder_task()
+        if not (self.cfg.plugin.enabled and self.cfg.reminder.enable_event_reminder):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._reminder_task = loop.create_task(self._reminder_loop(), name="ak_event_reminder")
+        except RuntimeError:
+            pass
+
+    def _reminder_sent_path(self) -> Path:
+        return self._data_dir / "reminder_sent.json"
+
+    def _load_reminder_sent(self) -> dict[str, int]:
+        import json
+
+        p = self._reminder_sent_path()
+        if not p.exists():
+            return {}
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {str(k): int(v) for k, v in raw.items() if isinstance(v, (int, float))}
+        except Exception:
+            pass
+        return {}
+
+    def _save_reminder_sent(self, data: dict[str, int]) -> None:
+        import json
+
+        p = self._reminder_sent_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            now_ts = int(time.time())
+            # 自动清理已过期超过 7 天的推送记录，避免文件膨胀
+            cleaned = {k: v for k, v in data.items() if (now_ts - v) < 7 * 86400}
+            p.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    async def _reminder_loop(self) -> None:
+        import asyncio
+
+        # 启动后稍作延迟，待宿主会话流初始化完成再进入巡检
+        await asyncio.sleep(20)
+        while True:
+            try:
+                await self._check_and_push_event_reminders()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self.ctx:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 活动到期提醒巡检异常: {_exc_text(exc)}")
+            await asyncio.sleep(600)
+
+    async def _check_and_push_event_reminders(self) -> None:
+        import asyncio
+        import datetime
+
+        if not self._is_enabled() or not self.cfg.reminder.enable_event_reminder or not self._prts or not self.ctx:
+            return
+        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
+        now_dt = datetime.datetime.now(tz_cn)
+        target_hour = int(self.cfg.reminder.reminder_hour)
+        if now_dt.hour != target_hour:
+            return
+
+        chat_cap = getattr(self.ctx, "chat", None)
+        if not chat_cap or not hasattr(chat_cap, "get_all_streams"):
+            return
+
+        data = await self._prts.get_current_events_struct()
+        now_ts = int(now_dt.timestamp())
+        horizon = int(self.cfg.reminder.remind_before_hours) * 3600
+
+        closing_events = [
+            e for e in (data.get("events") or [])
+            if not e.get("is_soon") and not e.get("is_long") and 0 < (int(e.get("end_ts") or 0) - now_ts) <= horizon
+        ]
+        closing_gachas = (
+            [
+                g for g in (data.get("gachas") or [])
+                if not g.get("is_soon") and not g.get("is_long") and 0 < (int(g.get("end_ts") or 0) - now_ts) <= horizon
+            ]
+            if self.cfg.reminder.include_gacha
+            else []
+        )
+        if not closing_events and not closing_gachas:
+            return
+
+        streams = await chat_cap.get_all_streams(all_platforms=True)
+        if not isinstance(streams, list) or not streams:
+            return
+
+        sent_map = await asyncio.to_thread(self._load_reminder_sent)
+        changed = False
+
+        for s in streams:
+            if not isinstance(s, dict):
+                continue
+            sid = str(s.get("stream_id") or "").strip()
+            gid = str(s.get("group_id") or "").strip()
+            gname = str(s.get("group_name") or "").strip()
+            plat = str(s.get("platform") or "").strip().lower()
+            # 仅推送到群聊，且严格遵守群聊开关与黑/白名单
+            if not sid or not gid:
+                continue
+            if not self._scope_allowed(group_id=gid, group_name=gname, platform=plat):
+                continue
+
+            todo_ev = [
+                e for e in closing_events
+                if f"{sid}|ev|{e['name']}|{e['end_ts']}" not in sent_map
+            ]
+            todo_ga = [
+                g for g in closing_gachas
+                if f"{sid}|ga|{g['name']}|{g['end_ts']}" not in sent_map
+            ]
+            if not todo_ev and not todo_ga:
+                continue
+
+            lines = ["【明日方舟 · 活动即将关闭提醒】"]
+            for e in todo_ev:
+                lines.append(f"• 活动「{e['name']}」{e['remain']}（{e['period']}）")
+            for g in todo_ga:
+                lines.append(f"• 卡池「{g['name']}」{g['remain']}（{g['period']}）")
+            lines.append("记得及时清理理智、搬空商店与领取奖励～")
+            msg = "\n".join(lines)
+
+            try:
+                ok_txt = _send_ok(await self.ctx.send.text(msg, stream_id=sid))
+                if ok_txt:
+                    for e in todo_ev:
+                        sent_map[f"{sid}|ev|{e['name']}|{e['end_ts']}"] = now_ts
+                    for g in todo_ga:
+                        sent_map[f"{sid}|ga|{g['name']}|{g['end_ts']}"] = now_ts
+                    changed = True
+                    # 顺便附发一张对应的海报卡片图（若有）
+                    if self.cfg.render.enable_cards and not self._platform_no_image(plat):
+                        focus = "events" if todo_ev and not todo_ga else ("gacha" if todo_ga and not todo_ev else "all")
+                        await self._send_events_card_or_text(sid, focus=focus, platform=plat)
+            except Exception as exc:
+                self.ctx.logger.warning(f"[明日方舟wiki插件] 向群 {gid} 发送活动到期提醒失败: {_exc_text(exc)}")
+
+        if changed:
+            await asyncio.to_thread(self._save_reminder_sent, sent_map)
+
     async def on_load(self) -> bool:
         self._build_services()
         if self._store and self._prts:
@@ -566,6 +763,7 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 await asyncio.to_thread(self._store.cleanup_expired, self._prts.page_ttl_seconds)
             except Exception:
                 pass
+        self._start_reminder_task_if_needed()
         if self.ctx:
             cache_path = self._store.data_dir if self._store else _resolve_data_dir()
             self.ctx.logger.info(
@@ -576,13 +774,16 @@ class ArknightsWikiPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != "self":
             return
+        self._stop_reminder_task()
         if self._prts:
             await self._prts.close()
         self._build_services()
+        self._start_reminder_task_if_needed()
         if self.ctx:
             self.ctx.logger.info("[明日方舟wiki插件] 配置已热更新并重建客户端")
 
     async def on_unload(self) -> None:
+        self._stop_reminder_task()
         if self._prts:
             await self._prts.close()
 
@@ -936,18 +1137,359 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                     self.ctx.logger.warning(f"[明日方舟wiki插件] 帮助图渲染失败（已降级纯文本）: {_exc_text(exc)}")
 
         help_msg = (
-            "【明日方舟wiki插件 · 全部指令】\n"
-            "• /方舟帮助  （显示指令速查图）\n"
-            "• /方舟 <干员/外号/词条> [总览|技能|模组|材料|档案]\n"
-            "• /方舟 总计 <干员> [精二|一二三技能|模组]  （一键算养成材料总账）\n"
-            "• /立绘 <干员/外号> [精二|初始|皮肤1|皮肤名|列表]\n"
-            "• /公招 <词条1> <词条2> ...  （公招保底组合计算器）\n"
-            "• /方舟 活动  （速查国服当期活动与卡池）\n"
-            "• /方舟 语音 <干员> [戳一戳|信赖|交谈|随机]\n"
-            "• /方舟 别名 [列表|添加 外号 干员|删除 外号]\n"
-            "• /方舟 缓存  /  /方舟 清理缓存（群聊限管理员）"
+            "【明日方舟wiki · 指令手册】\n"
+            "• /方舟 干员 [板块]  — 总览 · 技能 · 模组 · 材料 · 档案\n"
+            "• /公招 词条 或 附图  — 算公招保底（支持带图或回复截图识图）\n"
+            "• /方舟 敌人 名称 [级别]  — 查 BOSS 与敌人数值、免疫与机制\n"
+            "• /立绘 干员 [版本]  — 精二 · 初始 · 皮肤 · 列表\n"
+            "• /方舟 总计 干员 [范围]  — 精二专三模组材料总账\n"
+            "• /方舟 语音 干员 [关键词]  — 干员台词彩蛋（仅发文字，不含语音）\n"
+            "• /方舟 卡池 · /方舟 活动  — 当期寻访与活动官方海报图\n"
+            "• /方舟 别名 列表·添加·删除  — 自定义黑话（增删限管理）\n"
+            "• /方舟 缓存 · /方舟 清理缓存  — 查看或清空本地缓存（清理限管理）"
         )
         return await self._command_reply(stream_id, help_msg, "已发送帮助文本", platform=platform)
+
+    async def _send_recruit_card_or_text(
+        self,
+        stream_id: str,
+        tags: list[str],
+        *,
+        platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """计算公开招募保底组合；优先发送黑曜石金箔半身像卡片图，不可用时自动降级纯文本。"""
+        if not self._prts or not self.ctx:
+            return False, "", 0
+        try:
+            data = await self._prts.calculate_recruit_struct(tags)
+        except Exception as exc:
+            return await self._command_reply(stream_id, f"公招计算失败：{_exc_text(exc)}", "公招计算失败", platform=platform)
+
+        if not data.get("ok"):
+            msg = str(data.get("error") or "未找到高星保底组合。")
+            return await self._command_reply(stream_id, msg, "已发送公招提示", platform=platform)
+
+        if self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                try:
+                    now = time.time()
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    ckey = ("__recruit__", "|".join(sorted(data["tags"])), "", scale)
+                    hit = self._card_png.get(ckey)
+                    if hit and now - hit[0] < 3600.0:
+                        b64 = hit[1]
+                    else:
+                        html_str, vp_w, vp_h, complete = await build_recruit_card_html(self._prts, data)
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": max(360, vp_h)},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=15000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64 and complete:
+                            self._card_png[ckey] = (now, str(b64))
+                            while len(self._card_png) > 24:
+                                self._card_png.pop(next(iter(self._card_png)))
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        return True, "已发送公招卡片图", 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 公招卡片渲染或发送失败: {_exc_text(exc)}")
+                return await self._command_reply(stream_id, "公招卡片图渲染或发送失败，请稍后重试。", "公招出图失败", platform=platform)
+
+        reply = self._prts.format_recruit_text(data)
+        return await self._command_reply(stream_id, reply, "已发送公招计算结果", platform=platform)
+
+    async def _send_enemy_card_or_text(
+        self,
+        stream_id: str,
+        target: str,
+        detail: str = "",
+        *,
+        platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """查询 BOSS/敌人数值与机制；优先发黑曜石档案卡片图，不可用时自动降级纯文本。"""
+        if not self._prts or not self.ctx:
+            return False, "", 0
+        try:
+            en = await self._prts.get_enemy_struct(target, detail=detail)
+        except Exception as exc:
+            return await self._command_reply(stream_id, f"查询敌人信息失败：{_exc_text(exc)}", "查询敌人失败", platform=platform)
+
+        if not en:
+            return await self._command_reply(stream_id, f"未在 PRTS Wiki 找到敌人或 BOSS「{target}」。", "未找到敌人", platform=platform)
+
+        if self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                try:
+                    now = time.time()
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    ckey = ("__enemy__", en["name"], str(en.get("level_index", 0)), scale)
+                    hit = self._card_png.get(ckey)
+                    if hit and now - hit[0] < 3600.0:
+                        b64 = hit[1]
+                    else:
+                        html_str, vp_w, vp_h, complete = await build_enemy_card_html(self._prts, en)
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": max(360, vp_h)},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=15000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64 and complete:
+                            self._card_png[ckey] = (now, str(b64))
+                            while len(self._card_png) > 24:
+                                self._card_png.pop(next(iter(self._card_png)))
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        return True, f"已发送 {en['name']} 敌方档案卡", 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 敌人卡片渲染失败（已降级纯文本）: {_exc_text(exc)}")
+
+        return await self._command_reply(stream_id, self._prts.format_enemy_text(en), f"已发送 {en['name']} 敌人资料", platform=platform)
+
+    async def _send_events_card_or_text(
+        self,
+        stream_id: str,
+        *,
+        focus: str = "events",
+        platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """查询国服当期寻访卡池或当期活动；优先发黑曜石官方横幅海报卡，不可用时自动降级纯文本。"""
+        if not self._prts or not self.ctx:
+            return False, "", 0
+        try:
+            data = await self._prts.get_current_events_struct()
+        except Exception as exc:
+            return await self._command_reply(stream_id, f"查询当期活动与卡池失败：{_exc_text(exc)}", "查询活动失败", platform=platform)
+
+        if focus == "gacha":
+            items = data.get("gachas") or []
+        elif focus == "events":
+            items = data.get("events") or []
+        else:
+            items = (data.get("gachas") or []) + (data.get("events") or [])
+        if not items:
+            tip = "暂未从 PRTS 获取到当期寻访卡池信息，请稍后再试。" if focus == "gacha" else "暂未从 PRTS 获取到当期活动信息，请稍后再试。"
+            return await self._command_reply(stream_id, tip, "暂无当期数据", platform=platform)
+
+        if self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                try:
+                    now = time.time()
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    ckey = ("__events__", focus, "", scale)
+                    hit = self._card_png.get(ckey)
+                    if hit and now - hit[0] < 900.0:
+                        b64 = hit[1]
+                    else:
+                        html_str, vp_w, vp_h, complete = await build_events_card_html(self._prts, data, focus=focus)
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": max(380, vp_h)},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=15000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64 and complete:
+                            self._card_png[ckey] = (now, str(b64))
+                            while len(self._card_png) > 24:
+                                self._card_png.pop(next(iter(self._card_png)))
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        label = "已发送当期寻访卡池图" if focus == "gacha" else "已发送当期活动海报图"
+                        return True, label, 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 活动/卡池卡片渲染失败（已降级纯文本）: {_exc_text(exc)}")
+
+        reply = self._prts.format_current_events_text(data, focus=focus)
+        label = "已发送当期寻访卡池" if focus == "gacha" else "已发送当期活动"
+        return await self._command_reply(stream_id, reply, label, platform=platform)
+
+    @staticmethod
+    def _extract_image_and_reply_from_msg(msg: Any) -> tuple[str, str]:
+        """从消息字典/对象中递归提取第一张图片（data URI / base64 / URL）以及引用消息 ID。"""
+        image_ref = ""
+        reply_id = ""
+
+        def _norm_img(val: Any) -> str:
+            if isinstance(val, dict):
+                for k in ("base64", "image_base64", "b64", "url", "file", "data"):
+                    v = val.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return _norm_img(v)
+                return ""
+            if not isinstance(val, str):
+                return ""
+            s = val.strip()
+            if not s:
+                return ""
+            if s.startswith(("data:image/", "http://", "https://")):
+                return s
+            # 裸 base64 图片（常见 PNG/JPEG/WEBP 头或长度 > 128 且不含空白）
+            if len(s) > 128 and not any(ch.isspace() for ch in s[:64]):
+                mime = "image/jpeg" if s.startswith("/9j/") else ("image/webp" if s.startswith("UklGR") else "image/png")
+                return f"data:{mime};base64,{s}"
+            return ""
+
+        def _walk_segs(segs: Any) -> None:
+            nonlocal image_ref, reply_id
+            if isinstance(segs, dict):
+                st = str(segs.get("type") or "").lower()
+                data = segs.get("data")
+                if st in ("image", "img", "photo") and not image_ref:
+                    image_ref = _norm_img(data)
+                elif st == "reply" and not reply_id:
+                    if isinstance(data, dict):
+                        reply_id = str(data.get("id") or data.get("message_id") or "").strip()
+                    elif data is not None:
+                        reply_id = str(data).strip()
+                elif st == "seglist" and isinstance(data, list):
+                    _walk_segs(data)
+            elif isinstance(segs, list):
+                for item in segs:
+                    _walk_segs(item)
+            elif hasattr(segs, "type") and hasattr(segs, "data"):
+                _walk_segs({"type": getattr(segs, "type", ""), "data": getattr(segs, "data", None)})
+
+        if isinstance(msg, dict):
+            for key in ("message_segments", "raw_message", "segments", "seg_list"):
+                if msg.get(key):
+                    _walk_segs(msg.get(key))
+            if not reply_id:
+                reply_id = str(msg.get("reply_to") or msg.get("reply_id") or msg.get("reply_message_id") or "").strip()
+            if not image_ref:
+                for key in ("image_base64", "image_url", "image"):
+                    if msg.get(key):
+                        image_ref = _norm_img(msg.get(key))
+                        if image_ref:
+                            break
+        return image_ref, reply_id
+
+    async def _find_recruit_image(self, kwargs: dict[str, Any], stream_id: str, user_id: str) -> str:
+        """按顺序查找：1) 当前消息附带图；2) 引用/回复的消息图；3) 同用户 60 秒内刚发的上一张图。"""
+        msg = kwargs.get("message")
+        img_ref, reply_id = self._extract_image_and_reply_from_msg(msg)
+        if img_ref:
+            return img_ref
+
+        msg_cap = getattr(self.ctx, "message", None) if self.ctx else None
+        if not msg_cap:
+            return ""
+
+        # 1b) 当前消息有 message_id 但未附带二进制数据时，通过 get_by_id(include_binary_data=True) 拉取
+        cur_mid = ""
+        if isinstance(msg, dict):
+            minfo = msg.get("message_info") if isinstance(msg.get("message_info"), dict) else {}
+            cur_mid = str(msg.get("message_id") or minfo.get("message_id") or kwargs.get("message_id") or "").strip()
+        if cur_mid and hasattr(msg_cap, "get_by_id"):
+            try:
+                full_msg = await msg_cap.get_by_id(cur_mid, stream_id=stream_id, include_binary_data=True)
+                img_ref, rid2 = self._extract_image_and_reply_from_msg(full_msg)
+                if img_ref:
+                    return img_ref
+                reply_id = reply_id or rid2
+            except Exception:
+                pass
+
+        # 2) 引用/回复的消息里找图
+        if reply_id and hasattr(msg_cap, "get_by_id"):
+            try:
+                rep_msg = await msg_cap.get_by_id(reply_id, stream_id=stream_id, include_binary_data=True)
+                img_ref, _ = self._extract_image_and_reply_from_msg(rep_msg)
+                if img_ref:
+                    return img_ref
+            except Exception:
+                pass
+
+        # 3) 同用户 60 秒内刚发的图片（兼容「先发图、紧接着发 /公招」的顺手操作）
+        if hasattr(msg_cap, "get_recent") and hasattr(msg_cap, "get_by_id"):
+            try:
+                recent = await msg_cap.get_recent(stream_id, limit=5)
+                now = time.time()
+                if isinstance(recent, list):
+                    for item in reversed(recent):
+                        if not isinstance(item, dict):
+                            continue
+                        imid = str(item.get("message_id") or "").strip()
+                        if not imid or imid == cur_mid:
+                            continue
+                        ts = float(item.get("time") or item.get("timestamp") or 0.0)
+                        if ts and (now - ts) > 60.0:
+                            continue
+                        item_uid = str(item.get("user_id") or (item.get("user_info") or {}).get("user_id") or "").strip()
+                        if user_id and item_uid and _norm_token(item_uid) != _norm_token(user_id):
+                            continue
+                        full_item = await msg_cap.get_by_id(imid, stream_id=stream_id, include_binary_data=True)
+                        img_ref, _ = self._extract_image_and_reply_from_msg(full_item)
+                        if img_ref:
+                            return img_ref
+            except Exception:
+                pass
+        return ""
+
+    async def _recognize_recruit_tags_from_image(self, image_ref: str) -> tuple[list[str], str]:
+        """定向调用宿主 vlm 模型极简识别公招截图中的 5 个词条（仅在用户显式发 /公招 时触发）。"""
+        llm = getattr(self.ctx, "llm", None) if self.ctx else None
+        if not llm or not hasattr(llm, "generate"):
+            return [], "当前宿主未启用 VLM 识图能力，请直接输入词条，例如：/公招 资深 控场 减速"
+
+        # 若为远程 HTTP 图片 URL，先拉成 data URI 避免 VLM 接口无法访问内网/临时图链
+        img_url = image_ref
+        if img_url.startswith(("http://", "https://")) and self._prts:
+            try:
+                resp = await self._prts._client().get(img_url)
+                resp.raise_for_status()
+                ct = (resp.headers.get("content-type") or "image/png").split(";", 1)[0].strip()
+                if not ct.startswith("image/"):
+                    ct = "image/png"
+                img_url = f"data:{ct};base64," + base64.b64encode(resp.content).decode("ascii")
+            except Exception:
+                pass
+
+        prompt = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "这是一张《明日方舟》公开招募界面截图。"
+                            "请只输出图中「职业需求」里的全部招募词条（通常为5个，如：控场 资深干员 减速 削弱 位移），"
+                            "用空格隔开，不要输出任何其他解释或标点。"
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": img_url}},
+                ],
+            }
+        ]
+        try:
+            res = await llm.generate(prompt, task_name="vlm", temperature=0.0, max_tokens=64)
+        except Exception as exc:
+            return [], f"识别公招截图失败：{_exc_text(exc)}"
+
+        if not isinstance(res, dict) or not res.get("success"):
+            return [], "未能通过 VLM 识别该图片，请确认已配置视觉模型，或直接输入词条：/公招 资深 控场 减速"
+
+        raw_out = str(res.get("response") or "").strip()
+        tags = extract_recruit_tags_from_text(raw_out)
+        if not tags:
+            return [], "未在图片中识别到有效的明日方舟公招词条，请确认截图清晰包含「职业需求」词条。"
+        return tags, ""
 
     # ============================================================
     # Tool 1 & 2：显式可见工具（visibility="visible"，首轮即可调）
@@ -966,9 +1508,9 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="section",
                 param_type=ToolParamType.STRING,
-                description="板块：overview总览/skills技能/modules模组/materials材料/summary材料总账/voice语音/events当期活动/lore档案/wiki词条",
+                description="板块：overview总览/skills技能/modules模组/materials材料/summary材料总账/enemy敌人BOSS/voice语音/events当期活动/lore档案/wiki词条",
                 required=False,
-                enum_values=["overview", "skills", "modules", "materials", "summary", "voice", "events", "lore", "wiki"],
+                enum_values=["overview", "skills", "modules", "materials", "summary", "enemy", "voice", "events", "lore", "wiki"],
             ),
             ToolParameterInfo(
                 name="detail",
@@ -1011,21 +1553,46 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         if len(text) > 1200:
             text = text[:1185].rstrip() + "\n…（内容过长已精简）"
 
-        # 决定是否附发 2x 高清战术卡片图（聊天查材料/模组默认开启，不支持发图平台自动跳过）
+        # 决定是否附发 2x 高清战术卡片图（聊天查材料/模组/敌人/活动卡池默认开启，不支持发图平台自动跳过）
+        is_enemy_sec = sec in ("enemy", "boss", "敌人", "领袖")
+        is_events_sec = sec in ("events", "event", "活动", "卡池", "寻访", "gacha", "pool")
         want_card = (
             bool(send_card)
             if send_card is not None
-            else (self.cfg.render.auto_card_in_chat and sec in ("materials", "modules"))
+            else (self.cfg.render.auto_card_in_chat and (sec in ("materials", "modules") or is_enemy_sec or is_events_sec))
         )
         card_sent = False
         if want_card and stream_id and not self._platform_no_image(plat):
-            card_sent, _ = await self._render_and_send_card(
-                stream_id=stream_id,
-                target=str(target).strip(),
-                section=sec,
-                detail=str(detail or ""),
-                platform=plat,
-            )
+            if is_events_sec:
+                ev_focus = "gacha" if sec in ("卡池", "寻访", "gacha", "pool") else "events"
+                dedup_key = (stream_id, "__events__", ev_focus)
+                now = time.time()
+                if (now - self._recent_cards.get(dedup_key, 0.0)) >= 15.0:
+                    ok_ev, _, _ = await self._send_events_card_or_text(stream_id, focus=ev_focus, platform=plat)
+                    if ok_ev:
+                        self._recent_cards[dedup_key] = now
+                        card_sent = True
+            elif is_enemy_sec:
+                dedup_key = (stream_id, "__enemy__", f"{str(target).strip()}|{str(detail or '').strip()}")
+                now = time.time()
+                if (now - self._recent_cards.get(dedup_key, 0.0)) >= 15.0:
+                    ok_e, _, _ = await self._send_enemy_card_or_text(
+                        stream_id=stream_id,
+                        target=str(target).strip(),
+                        detail=str(detail or ""),
+                        platform=plat,
+                    )
+                    if ok_e:
+                        self._recent_cards[dedup_key] = now
+                        card_sent = True
+            else:
+                card_sent, _ = await self._render_and_send_card(
+                    stream_id=stream_id,
+                    target=str(target).strip(),
+                    section=sec,
+                    detail=str(detail or ""),
+                    platform=plat,
+                )
         if card_sent:
             stop_now = bool(self.cfg.render.stop_planner_after_image)
             return {"success": True, "content": "已发送高清卡片图。", "stop_after_execution": stop_now}
@@ -1108,6 +1675,58 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         fallback = self._sanitize_for_platform(fallback, plat)
         return {"success": False, "content": fallback, "error": fallback}
 
+    @Tool(
+        name="ak_recruit_calc",
+        description="计算《明日方舟》公开招募保底组合并发送半身像卡片图。看到公招截图或公招词条时调用。",
+        parameters=[
+            ToolParameterInfo(
+                name="tags",
+                param_type=ToolParamType.STRING,
+                description="公招词条，逗号或空格分隔（如：控场,资深干员,减速,削弱,位移）",
+                required=True,
+            ),
+        ],
+        visibility="visible",
+    )
+    async def tool_recruit_calc(
+        self,
+        tags: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not self._is_enabled() or not self._prts or not self.ctx:
+            return {"success": False, "content": "明日方舟wiki插件未启用。"}
+        stream_id, gid, uid, plat = self._extract_stream_and_ids(kwargs)
+        allowed, plat = await self._scope_allowed_async(
+            stream_id=stream_id, group_id=gid, user_id=uid, platform=plat, group_name=_message_group_name(kwargs),
+        )
+        if not allowed:
+            return {"success": False, "content": "当前会话未开启明日方舟wiki插件。"}
+
+        raw_parts = [t for t in re.split(r"[\s,，/、+]+", str(tags or "").strip()) if t]
+        if len(raw_parts) <= 1 and tags:
+            extracted = extract_recruit_tags_from_text(str(tags))
+            if extracted:
+                raw_parts = extracted
+        if not raw_parts:
+            return {"success": False, "content": "请提供至少 1 个公招词条。"}
+
+        if not stream_id:
+            txt = await self._prts.calculate_recruit(raw_parts)
+            return {"success": True, "content": self._sanitize_for_platform(txt, plat)}
+
+        # 10 秒防重：同一会话同一组词条不连发两张图
+        dedup_key = (stream_id, "__recruit__", "|".join(sorted(raw_parts)))
+        now = time.time()
+        if (now - self._recent_cards.get(dedup_key, 0.0)) < 10.0:
+            return {"success": True, "content": "刚刚已发送过该公招组合图。", "stop_after_execution": True}
+
+        ok, summary, _ = await self._send_recruit_card_or_text(stream_id, raw_parts, platform=plat)
+        if ok:
+            self._recent_cards[dedup_key] = now
+            stop_now = bool(self.cfg.render.stop_planner_after_image)
+            return {"success": True, "content": summary or "已发送公招卡片图。", "stop_after_execution": stop_now}
+        return {"success": False, "content": summary or "公招组合发送失败。", "error": summary or "公招组合发送失败。"}
+
     # ============================================================
     # Commands：快捷直出指令（返回三元组 intercept=2，100% 阻止进 Planner）
     # ============================================================
@@ -1143,13 +1762,23 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         if not allowed:
             return False, "", 0
 
-        arg_str = _command_args(kwargs, _RE_RECRUIT_COMMAND)
-        tags = [t for t in re.split(r"[\s,，/、+]+", arg_str) if t]
-        try:
-            reply = await self._prts.calculate_recruit(tags)
-        except Exception as exc:
-            reply = f"公招计算失败：{_exc_text(exc)}"
-        return await self._command_reply(stream_id, reply, "已发送公招计算结果", platform=plat)
+        raw_arg_str = _command_args(kwargs, _RE_RECRUIT_COMMAND)
+        # 剥离宿主自动拼进文本里的 [图片：...] / [回复：...] 等占位符，避免把图片描述误当成手打词条
+        clean_arg_str = _RE_MSG_PLACEHOLDER.sub(" ", raw_arg_str).strip()
+        tags = [t for t in re.split(r"[\s,，/、+]+", clean_arg_str) if t]
+        if not tags:
+            img_ref = await self._find_recruit_image(kwargs, stream_id, uid)
+            if img_ref:
+                tags, err = await self._recognize_recruit_tags_from_image(img_ref)
+                if err:
+                    return await self._command_reply(stream_id, err, "公招截图识别失败", platform=plat)
+            elif raw_arg_str:
+                # 少数适配器未回传图片二进制时，兜底从占位描述中按官方词条白名单精准抽取
+                tags = extract_recruit_tags_from_text(raw_arg_str)
+            if not tags:
+                tip = "用法：/公招 <词条1> <词条2> ...，或带图 / 回复公招截图发 /公招（例：/公招 资深 控场 减速）"
+                return await self._command_reply(stream_id, tip, "已提示公招用法", platform=plat)
+        return await self._send_recruit_card_or_text(stream_id, tags, platform=plat)
 
     async def _handle_alias_subcmd(self, args: list[str], *, gid: str, uid: str, platform: str, private: bool) -> str:
         """处理 /方舟 别名 [列表|添加|删除] 子命令。"""
@@ -1248,12 +1877,11 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 msg = "缓存仓库未初始化。"
             return await self._command_reply(stream_id, msg, msg, platform=plat)
 
-        if low_arg in ("活动", "当期活动", "卡池", "寻访", "events", "event"):
-            try:
-                reply = await self._prts.query_current_events()
-            except Exception as exc:
-                reply = f"查询当期活动失败：{_exc_text(exc)}"
-            return await self._command_reply(stream_id, reply, "已发送当期活动与卡池", platform=plat)
+        if low_arg in ("卡池", "寻访", "当期卡池", "gacha", "pool"):
+            return await self._send_events_card_or_text(stream_id, focus="gacha", platform=plat)
+
+        if low_arg in ("活动", "当期活动", "events", "event"):
+            return await self._send_events_card_or_text(stream_id, focus="events", platform=plat)
 
         parts = arg_str.split()
         p0 = parts[0].lower()
@@ -1265,12 +1893,21 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             return await self._command_reply(stream_id, msg, "已处理别名管理", platform=plat)
 
         if p0 in ("公招", "公开招募", "recruit"):
-            tags = [t for t in re.split(r"[\s,，/、+]+", " ".join(parts[1:])) if t]
-            try:
-                reply = await self._prts.calculate_recruit(tags)
-            except Exception as exc:
-                reply = f"公招计算失败：{_exc_text(exc)}"
-            return await self._command_reply(stream_id, reply, "已发送公招计算结果", platform=plat)
+            raw_rest = " ".join(parts[1:])
+            clean_rest = _RE_MSG_PLACEHOLDER.sub(" ", raw_rest).strip()
+            tags = [t for t in re.split(r"[\s,，/、+]+", clean_rest) if t]
+            if not tags:
+                img_ref = await self._find_recruit_image(kwargs, stream_id, uid)
+                if img_ref:
+                    tags, err = await self._recognize_recruit_tags_from_image(img_ref)
+                    if err:
+                        return await self._command_reply(stream_id, err, "公招截图识别失败", platform=plat)
+                elif raw_rest:
+                    tags = extract_recruit_tags_from_text(raw_rest)
+            return await self._send_recruit_card_or_text(stream_id, tags, platform=plat)
+
+        if p0 in ("敌人", "boss", "领袖", "enemy") and len(parts) >= 2:
+            return await self._send_enemy_card_or_text(stream_id, parts[1], detail=" ".join(parts[2:]), platform=plat)
 
         if p0 in ("总计", "汇总", "总账", "缺口", "summary") and len(parts) >= 2:
             try:

@@ -237,18 +237,26 @@ async def build_operator_card_html(
     )
     cards: list[str] = []
     for sk in op.get('skills') or []:
-        sp = f"初{sk.get('init_sp', '-')} / 消{sk['cost_sp']}" if sk.get('cost_sp') else ''
-        du = f"持{sk['duration']}" if sk.get('duration') else ''
+        sp_init = f"初 {sk['init_sp']}" if sk.get('init_sp') not in (None, '', '-') else ''
+        sp_cost = f"消 {sk['cost_sp']}" if sk.get('cost_sp') else ''
+        du = f"持 {sk['duration']}" if sk.get('duration') else ''
         pl = ''.join(
             f"<span class='p {c}'>{_esc(v)}</span>"
-            for c, v in (('g', sk.get('level')), ('', sk.get('recovery')), ('', sk.get('trigger')), ('s', sp), ('s', du))
+            for c, v in (
+                ('g', sk.get('level')),
+                ('', sk.get('recovery')),
+                ('', sk.get('trigger')),
+                ('s', sp_init),
+                ('s', sp_cost),
+                ('s', du),
+            )
             if v
         )
         cards.append(
             f"<div class='sk'><div class='sh'><span class='sn'>{_esc(sk.get('index'))}. {_esc(sk.get('name'))}</span>"
             f"<div class='sp'>{pl}</div></div><div class='sd'>{_esc(sk.get('desc'))}</div></div>"
         )
-    skills = _sec('02', '核心技能（满级/专三数据）', 'SKILLS', ''.join(cards)) if cards else ''
+    skills = _sec('02', '核心技能 · 满级专三', 'SKILLS', ''.join(cards)) if cards else ''
     body = _hdr(op, label, av_uri) + "<div class='bd'>" + top + skills + '</div>'
     return _doc(f'{name} 档案', body, ac, soft, width), width, 480 + len(cards) * 110, complete
 
@@ -256,45 +264,421 @@ async def build_operator_card_html(
 def build_help_card_html() -> tuple[str, int, int]:
     """构建帮助卡片 HTML，返回 (html, width, est_height)。"""
     ac, soft = '#F5A623', 'rgba(245,166,35,.14)'
-    width = 660
+    width = 720
 
-    def box(title: str, tag: str, items: list[tuple[str, str, str]]) -> str:
-        rows = ''.join(
-            "<div class='hi'><span class='hc'>%s</span><div class='hy'>%s</div>%s</div>"
-            % (_esc(c), _esc(d), f"<div class='he'>{_esc(e)}</div>" if e else '')
-            for c, d, e in items
+    def hero(num: str, title: str, color: str, cmd: str, arg: str, desc_html: str, ex: str) -> str:
+        arg_html = f"<u>{_esc(arg)}</u>" if arg else ""
+        return (
+            f"<div class='hf' style='--fc:{color}'>"
+            f"<div class='hf-t'><b>{_esc(title)}</b><i>{num}</i></div>"
+            f"<div class='hc'>{_esc(cmd)}{arg_html}</div>"
+            f"<div class='hf-d'>{desc_html}</div>"
+            f"<div class='hf-e'>{_esc(ex)}</div>"
+            f"</div>"
+        )
+
+    heroes = "<div class='h3'>" + "".join((
+        hero(
+            "01", "干员档案", "#F5A623",
+            "/方舟", "干员名 [板块]",
+            "支持 <b>总览 · 技能 · 模组 · 材料</b> 与外号，一键出卡片图。",
+            "例：/方舟 ew 模组",
+        ),
+        hero(
+            "02", "公开招募", "#7FB8D6",
+            "/公招", "词条 或 附图",
+            "算保底出半身像卡，支持手打词条、<b>带图</b>或<b>回复截图</b>识图。",
+            "例：/公招 资深 狙击",
+        ),
+        hero(
+            "03", "敌方档案", "#E05A5A",
+            "/方舟 敌人", "名称 [级别]",
+            "查 <b>BOSS 与敌人</b> 血攻防抗、控制免疫、多档级别与机制。",
+            "例：/方舟 敌人 爱国者",
+        ),
+    )) + "</div>"
+
+    def section_box(title: str, tag: str, rows_data: list[tuple[str, str, str]]) -> str:
+        rows = "".join(
+            f"<div class='hl'><span class='hl-c'>{_esc(cmd)}"
+            f"{f'<u>{_esc(arg)}</u>' if arg else ''}</span>"
+            f"<span class='hl-d'>{_esc(desc)}</span></div>"
+            for cmd, arg, desc in rows_data
         )
         return f"<div class='hb'><div class='hh'><span>{_esc(title)}</span><s>{tag}</s></div>{rows}</div>"
 
-    boxes = ''.join((
-        box('干员资料 & 卡片图', 'WIKI', [
-            ('/方舟 <干员/外号> [板块]', '板块可选：总览 / 技能 / 模组 / 材料 / 档案（别名 /prts /ark）', '例：/方舟 ew 模组　/方舟 叔叔 材料'),
-            ('/方舟 总计 <干员> [范围]', '一键汇总精二、专三、模组养成材料总账', '例：/方舟 总计 维什戴尔 精二 三技能 模组'),
+    boxes = "<div class='hg'>" + "".join((
+        section_box("情报与图鉴", "ARCHIVE", [
+            ("/立绘", "干员 [版本]", "精二 · 初始 · 皮肤 · 列表"),
+            ("/方舟 总计", "干员 [范围]", "精二专三模组材料一键总账"),
+            ("/方舟 语音", "干员 [词]", "台词彩蛋（仅文字无语音）"),
+            ("/方舟 卡池", "· 活动", "当期寻访与活动海报图"),
         ]),
-        box('高清立绘 & 皮肤', 'ILLUST', [
-            ('/立绘 <干员/外号> [版本]', '支持 精二 / 初始 / 皮肤1 / 皮肤中文名 / 列表（别名 /ak图）', '例：/立绘 水陈 列表　/立绘 42 皮肤1'),
-            ('/方舟 语音 <干员> [关键词]', '查看干员中文台词彩蛋（戳一戳/信赖/交谈/问候/随机）', '例：/方舟 语音 叔叔 戳一戳'),
+        section_box("终端与管理", "SYSTEM", [
+            ("/方舟 别名", "[增删]", "查看或热增删黑话（限管理）"),
+            ("/方舟 缓存", "", "查看本地词条与图片缓存占用"),
+            ("/方舟 清理缓存", "", "一键清空本地缓存（限管理）"),
+            ("/方舟帮助", "", "随时呼出本终端指令手册"),
         ]),
-        box('实用工具', 'TOOLS', [
-            ('/公招 <词条1> <词条2> ...', '毫秒级算公招保底组合（支持高资/资深/机械/高台/地面等简写）', '例：/公招 资深 狙击 削弱 爆发 生存'),
-            ('/方舟 活动', '速查国服当前进行中的活动、卡池与剩余时间', ''),
-        ]),
-        box('黑话与缓存管理', 'ADMIN', [
-            ('/方舟 别名 [列表|添加|删除]', '查看或热增删群内自定义黑话外号（增删限管理员）', '例：/方舟 别名 添加 牢猫 凯尔希'),
-            ('/方舟 缓存　/方舟 清理缓存', '查看本地缓存占用，或由管理员一键清空缓存', ''),
-        ]),
-    ))
+    )) + "</div>"
+
     hdr = (
         "<div class='hd' data-w='PRTS'><div class='hm'><div class='nm'>"
-        "<span class='on'>明日方舟wiki插件 · 指令速查</span></div>"
-        "<div class='en' style='margin-top:4px'>Rhodes Island Terminal // PRTS Wiki &amp; Recruitment</div></div>"
-        "<div class='hr'><b>PRTS // TERMINAL</b><span>COMMAND GUIDE</span></div></div><div class='hz'></div>"
+        "<span class='on'>明日方舟wiki · 指令手册</span></div>"
+        "<div class='en' style='margin-top:4px'>Rhodes Island Terminal // PRTS Wiki &amp; Tactical Index</div></div>"
+        "<div class='hr'><b>PRTS // TERMINAL</b><span>COMMAND MANUAL</span></div></div><div class='hz'></div>"
     )
     tip = (
         "<div class='tp'>"
-        + _esc('日常聊天也无需打指令：直接问「ew 模组开哪个」「玛恩纳精二要什么材料」「看看水陈皮肤」即可自动响应；'
-               '发 /方舟帮助 可随时呼出本速查图。数据来源 PRTS Wiki (CC BY-NC-SA 4.0)。')
-        + '</div>'
+        "<span class='tp-b'>日常直聊免指令</span>"
+        "<div class='tp-q'>"
+        "<span>ew 模组开哪个</span>"
+        "<span>玛恩纳精二材料</span>"
+        "<span>看看水陈皮肤</span>"
+        "</div>"
+        "<div class='tp-s'>群聊直接提及即可自动响应 · 简写指令 /prts、/ark、/ak图 · 敌人别名 boss</div>"
+        "</div>"
     )
-    body = hdr + "<div class='bd'><div class='hg'>" + boxes + '</div>' + tip + '</div>'
-    return _doc('明日方舟wiki插件 帮助', body, ac, soft, width), width, 700
+    body = hdr + "<div class='bd'>" + heroes + boxes + tip + "</div>"
+    return _doc('明日方舟wiki插件 帮助', body, ac, soft, width), width, 600
+
+
+async def build_recruit_card_html(
+    prts: PRTSClient,
+    data: dict[str, Any],
+) -> tuple[str, int, int, bool]:
+    """构建黑曜石金箔风格公开招募卡片 HTML（120px 半身像 + CSS class 去重复用），返回 (html, width, est_height, complete)。"""
+    norm_tags: list[str] = list(data.get("tags") or [])
+    combos: list[dict[str, Any]] = list(data.get("combos") or [])
+
+    # 收集去重干员半身像文件名，同一干员在多个组合里出现只拉一次、只嵌一份 Base64
+    op_names = list(dict.fromkeys(
+        op["name"] for c in combos for op in (c.get("operators") or []) if op.get("name")
+    ))
+    need_files = [f"半身像_{n}_1.png" for n in op_names]
+    uris, complete = await prts.fetch_file_data_uris(need_files, thumb_width=120)
+
+    op_cls_map: dict[str, str] = {}
+    css_rules: list[str] = []
+    for n in op_names:
+        uri = uris.get(f"半身像_{n}_1.png") or ""
+        if uri:
+            cls = f"o{len(op_cls_map)}"
+            op_cls_map[n] = cls
+            css_rules.append(f".{cls}{{background-image:url({uri})}}")
+
+    max_ops = max((len(c.get("operators") or []) for c in combos), default=1)
+    width = 860 if max_ops > 10 else 720
+    inner_w = width - 68
+    per_row = 12 if width >= 860 else 10
+
+    top_score = combos[0]["score"] if combos else 40
+    top_rarity = 6 if top_score >= 60 else (5 if top_score >= 50 else (1 if top_score == 45 else 4))
+    ac, soft = _PALETTE.get(top_rarity, _PALETTE[5])
+
+    # 头部：输入词条胶囊 + 招募时长提醒
+    tag_pills = "".join(f"<span class='t a'>{_esc(t)}</span>" for t in norm_tags)
+    tips_badges: list[str] = []
+    if any(t in norm_tags for t in ("高级资深干员", "资深干员")):
+        tips_badges.append("<span class='t b'>建议拉满 9:00</span>")
+    if "支援机械" in norm_tags or any(c.get("is_robot") for c in combos):
+        tips_badges.append("<span class='t b'>小车请设 3:50</span>")
+
+    hdr = (
+        f"<div class='hd' data-w='RECRUIT'><div class='hm'>"
+        f"<div class='nm'><span class='on'>公开招募 · 保底组合</span>"
+        f"<span class='en'>Public Recruitment</span></div>"
+        f"<div class='tg'>{tag_pills}{''.join(tips_badges)}</div></div>"
+        f"<div class='hr'><b>PRTS // RECRUIT</b><span>共 {len(combos)} 组保底</span></div></div>"
+        f"<div class='hz'></div>"
+    )
+
+    def _render_combo_box(c: dict[str, Any], is_wide: bool, grow: int = 1) -> str:
+        ops = c.get("operators") or []
+        is_robot = bool(c.get("is_robot"))
+        min_r = int(c.get("min_rarity") or 4)
+        rc = _PALETTE.get(1 if is_robot else min_r, _PALETTE[4])[0]
+        badge = "1★车" if is_robot else f"{min_r}★+"
+        tag_html = "".join(f"<span class='rt'>{_esc(t)}</span>" for t in (c.get("tags") or []))
+        op_cards: list[str] = []
+        for o in ops:
+            oname = o["name"]
+            orarity = max(1, min(6, int(o.get("rarity") or 4)))
+            oc = _PALETTE.get(orarity, _PALETTE[4])[0]
+            cls = op_cls_map.get(oname)
+            face = f"<i class='{cls}'></i>" if cls else f"<b>{_esc(oname[:3])}</b>"
+            op_cards.append(
+                f"<div class='ro'><div class='rp' style='--oc:{oc}'>{face}</div>"
+                f"<div class='rn'>{_esc(oname)}</div></div>"
+            )
+        style = f"--rc:{rc}" if is_wide else f"--rc:{rc};flex:{grow} 1 0%"
+        return (
+            f"<div class='rb{' wide' if is_wide else ''}' style='{style}'>"
+            f"<div class='rh'>{tag_html}<span class='rq'>{badge}</span></div>"
+            f"<div class='rl'>{''.join(op_cards)}</div></div>"
+        )
+
+    def _est_box_w(c: dict[str, Any]) -> int:
+        ops_n = len(c.get("operators") or [])
+        ops_w = ops_n * 64 + 22
+        tags_w = sum(len(t) * 12 + 20 for t in (c.get("tags") or [])) + 46 + 22
+        return max(ops_w, tags_w)
+
+    # 紧凑小组合（≤8人）放上方做 First-Fit 行装箱，大组合（>8人）统一放下方占满整行，彻底消除右侧空洞
+    compact_combos = [c for c in combos if len(c.get("operators") or []) <= 8]
+    wide_combos = [c for c in combos if len(c.get("operators") or []) > 8]
+
+    packed_rows: list[list[tuple[dict[str, Any], int]]] = []
+    for c in compact_combos:
+        w_need = _est_box_w(c)
+        placed = False
+        for row in packed_rows:
+            used = sum(w for _, w in row) + 10 * len(row)
+            if used + w_need <= inner_w:
+                row.append((c, w_need))
+                placed = True
+                break
+        if not placed:
+            packed_rows.append([(c, w_need)])
+
+    row_htmls: list[str] = []
+    est_rows = 0
+    for row in packed_rows:
+        boxes_str = "".join(_render_combo_box(c, False, grow=max(1, w // 40)) for c, w in row)
+        row_htmls.append(f"<div class='rr'>{boxes_str}</div>")
+        est_rows += 1
+    for c in wide_combos:
+        ops_n = len(c.get("operators") or [])
+        row_htmls.append(_render_combo_box(c, True))
+        est_rows += 1 + (ops_n + per_row - 1) // per_row
+
+    body = hdr + "<div class='bd'><div class='rg'>" + "".join(row_htmls) + "</div></div>"
+    est_h = max(360, 190 + est_rows * 145)
+    return _doc("公开招募组合", body, ac, soft, width, "".join(css_rules)), width, est_h, complete
+
+
+async def build_enemy_card_html(
+    prts: PRTSClient,
+    en: dict[str, Any],
+) -> tuple[str, int, int, bool]:
+    """构建黑曜石风格 BOSS / 敌人数值与机制速查卡片（完全复用 assets/card.css）。"""
+    name = en["name"]
+    rank = str(en.get("rank") or "普通")
+    if "领袖" in rank:
+        ac, soft = "#E55353", "rgba(229,83,83,.14)"
+    elif "精英" in rank:
+        ac, soft = "#F2A24E", "rgba(242,162,78,.13)"
+    else:
+        ac, soft = "#74BCEA", "rgba(116,188,234,.13)"
+
+    av_candidates = [f"头像_敌人_{name}.png", f"头像_敌人_{en.get('title','')}.png"]
+    uris, complete = await prts.fetch_file_data_uris(av_candidates, thumb_width=160)
+    av_uri = uris.get(av_candidates[0]) or uris.get(av_candidates[1]) or ""
+    av = f"<img src='{av_uri}'/>" if av_uri else f"<i>{_esc(name[:1])}</i>"
+
+    tags: list[str] = []
+    if rank:
+        tags.append(f"<span class='t a'>{_esc(rank)}</span>")
+    for k in ("race", "damage_type", "attack_mode", "move_mode"):
+        if en.get(k):
+            tags.append(f"<span class='t'>{_esc(en[k])}</span>")
+    if en.get("event"):
+        tags.append(f"<span class='t b'>{_esc(en['event'])}</span>")
+
+    lv_cnt = int(en.get("level_count") or 1)
+    lv_label = f"级别 {en.get('level_index', 0)}" + (f" · 可选 0~{lv_cnt - 1}" if lv_cnt > 1 else "")
+    wm = _esc(str(en.get("index") or "HOSTILE").upper())
+    hdr = (
+        f"<div class='hd' data-w='{wm}'><div class='av'>{av}</div>"
+        f"<div class='hm'><div class='nm'><span class='on'>{_esc(name)}</span>"
+        f"<span class='en'>{_esc(en.get('index') or 'HOSTILE UNIT')}</span></div>"
+        f"<div class='tg'>{''.join(tags)}</div></div>"
+        f"<div class='hr'><b>PRTS // HOSTILE</b><span>{_esc(lv_label)}</span></div></div><div class='hz'></div>"
+    )
+
+    st = en.get("stats") or {}
+    boxes = "".join(
+        f"<div class='sb'><i>{k}</i><b>{_esc(st.get(f, '-'))}</b></div>"
+        for k, f in (("生命上限", "hp"), ("攻击力", "atk"), ("防御力", "def"), ("法术抗性", "res"))
+    )
+    sub_pills = "".join(
+        f"<span class='t'>{k} {_esc(st.get(f))}{u}</span>"
+        for k, f, u in (
+            ("攻击间隔", "interval", "s"),
+            ("移速", "speed", ""),
+            ("重量", "weight", ""),
+            ("目标生命消耗", "life_point", ""),
+            ("元素抗性", "elem_res", ""),
+        )
+        if st.get(f) and str(st.get(f)) != "0"
+    )
+    imm_list = en.get("immunities") or []
+    imm_html = (
+        "".join(f"<span class='t a'>免疫 {_esc(x)}</span>" for x in imm_list)
+        if imm_list
+        else "<span class='t'>无常规控制免疫</span>"
+    )
+
+    parts: list[str] = [
+        _sec(
+            "01", "基础数值与抗性", "ATTRIBUTES & IMMUNITIES",
+            f"<div class='sg'>{boxes}</div>"
+            f"<div class='tg' style='margin-top:10px'>{sub_pills}</div>"
+            f"<div class='tg' style='margin-top:8px'>{imm_html}</div>",
+        )
+    ]
+
+    if en.get("ability"):
+        ab_lines = [ln.strip() for ln in en["ability"].splitlines() if ln.strip()]
+        ab_html = "".join(f"<div class='kv'>{_esc(ln)}</div>" for ln in ab_lines[:10])
+        parts.append(_sec("02", "核心特性与姿态", "MECHANICS", ab_html))
+
+    sk_cards: list[str] = []
+    for sk in (en.get("skills") or [])[:5]:
+        sp_pills = []
+        if sk.get("init_sp") and sk["init_sp"] != "9999":
+            sp_pills.append(f"<span class='p s'>初{sk['init_sp']}</span>")
+        if sk.get("cost_sp") and sk["cost_sp"] != "9999":
+            sp_pills.append(f"<span class='p s'>消{sk['cost_sp']}</span>")
+        sk_cards.append(
+            f"<div class='sk'><div class='sh'><span class='sn'>{_esc(sk['name'])}</span>"
+            f"<div class='sp'>{''.join(sp_pills)}</div></div>"
+            f"<div class='sd'>{_esc(sk['effect'])}</div></div>"
+        )
+    if sk_cards:
+        parts.append(_sec(f"{len(parts) + 1:02d}", "技能机制详情", "SKILLS", "".join(sk_cards)))
+
+    width = 680
+    est_h = 340 + len(sk_cards) * 105 + (180 if en.get("ability") else 0)
+    body = hdr + "<div class='bd'>" + "".join(parts) + "</div>"
+    return _doc(f"{name} 敌方档案", body, ac, soft, width), width, est_h, complete
+
+
+async def build_events_card_html(
+    prts: PRTSClient,
+    data: dict[str, Any],
+    *,
+    focus: str = "events",
+) -> tuple[str, int, int, bool]:
+    """构建黑曜石金箔风格「当期寻访卡池 / 当期活动」官方横幅海报卡片，返回 (html, width, est_height, complete)。"""
+    gachas = [] if focus == "events" else list((data.get("gachas") or [])[:6])
+    events = [] if focus == "gacha" else list((data.get("events") or [])[:6])
+    stamp = str(data.get("updated_at") or "")
+
+    timed_events = [e for e in events if not e.get("is_long")]
+    long_events = [e for e in events if e.get("is_long")]
+
+    need_files: list[str] = []
+    for item in gachas + timed_events + long_events:
+        b = str(item.get("banner") or "").strip()
+        if b:
+            need_files.append(b)
+    need_files = list(dict.fromkeys(need_files))
+
+    uris: dict[str, str] = {}
+    complete = True
+    if need_files:
+        uris, complete = await prts.fetch_file_data_uris(need_files, thumb_width=640)
+
+    ac, soft = "#F2A24E", "rgba(242,162,78,.15)"
+    width = 780
+
+    status_label = {
+        "live": "进行中",
+        "urgent": "即将结束",
+        "soon": "即将开启",
+        "long": "长期常驻",
+    }
+
+    def _poster(it: dict[str, Any], *, feat: bool = False) -> str:
+        st = str(it.get("status") or "live")
+        uri = uris.get(str(it.get("banner") or "")) or ""
+        img = f"<img src='{uri}'/>" if uri else f"<div class='eb-f'>{_esc(it.get('name') or 'PRTS')}</div>"
+        remain = str(it.get("remain") or "")
+        period = str(it.get("period") or "")
+        pct = int(it.get("pct") or 0)
+        bar = (
+            f"<div class='ep{' urgent' if st == 'urgent' else ''}'><i style='width:{pct}%'></i></div>"
+            if pct > 0 else ""
+        )
+        return (
+            f"<div class='ec{' feat' if feat else ''}'>"
+            f"<div class='eb'>{img}"
+            f"<span class='ef {st}'>{status_label.get(st, '进行中')}</span>"
+            f"<span class='er{' urgent' if st == 'urgent' else ''}'>{_esc(remain)}</span>"
+            f"</div>"
+            f"<div class='ei'>"
+            f"<div class='en-t'><span class='en-n'>{_esc(it.get('name') or '')}</span>"
+            f"{f'<span class=\"en-p\">{_esc(period)}</span>' if period else ''}</div>"
+            f"{bar}</div></div>"
+        )
+
+    sections: list[str] = []
+    est_h = 180
+
+    if gachas:
+        one_cls = " one" if len(gachas) == 1 else ""
+        # 奇数个且超过 1 个时，首张做通栏主视觉大海报，其余两列工整对齐
+        cards_html = "".join(
+            _poster(g, feat=(len(gachas) % 2 == 1 and idx == 0))
+            for idx, g in enumerate(gachas)
+        )
+        sections.append(_sec("01", "当期寻访卡池", "HEADHUNTING", f"<div class='eg{one_cls}'>{cards_html}</div>"))
+        rows_g = 1 if len(gachas) == 1 else (len(gachas) + 1) // 2
+        est_h += 70 + rows_g * 225
+
+    if timed_events or long_events:
+        ev_parts: list[str] = []
+        if timed_events:
+            one_cls = " one" if len(timed_events) == 1 else ""
+            ev_cards = "".join(
+                _poster(e, feat=(len(timed_events) % 2 == 1 and idx == 0))
+                for idx, e in enumerate(timed_events)
+            )
+            ev_parts.append(f"<div class='eg{one_cls}'>{ev_cards}</div>")
+            rows_e = 1 if len(timed_events) == 1 else (len(timed_events) + 1) // 2
+            est_h += rows_e * 225
+        if long_events:
+            long_cards: list[str] = []
+            for e in long_events:
+                uri = uris.get(str(e.get("banner") or "")) or ""
+                th = f"<div class='em-th'><img src='{uri}'/></div>" if uri else ""
+                sub = str(e.get("period") or e.get("remain") or "长期常驻")
+                long_cards.append(
+                    f"<div class='em-c'>{th}<div class='em-m'>"
+                    f"<div class='em-n'>{_esc(e.get('name') or '')}</div>"
+                    f"<div class='em-s'>{_esc(sub)}</div></div></div>"
+                )
+            el_cls = " one" if len(long_events) == 1 else ""
+            ev_parts.append(f"<div class='el{el_cls}'>{''.join(long_cards)}</div>")
+            est_h += ((len(long_events) + 1) // 2) * 76
+        sec_idx = f"{len(sections) + 1:02d}"
+        sections.append(_sec(sec_idx, "当期活动与常驻", "OPERATIONS", "".join(ev_parts)))
+        est_h += 70
+
+    if focus == "gacha":
+        title_cn = "明日方舟国服 · 当期寻访"
+        title_en = "Headhunting Schedule // CN Server"
+        badge = f"共 {len(gachas)} 个卡池"
+        watermark = "GACHA"
+    elif focus == "events":
+        title_cn = "明日方舟国服 · 当期活动"
+        title_en = "Operations Schedule // CN Server"
+        badge = f"共 {len(events)} 项活动"
+        watermark = "EVENTS"
+    else:
+        title_cn = "明日方舟国服 · 活动与卡池"
+        title_en = "Operations & Headhunting // CN Server"
+        badge = f"{len(gachas)} 卡池 · {len(events)} 活动"
+        watermark = "EVENTS"
+
+    hdr = (
+        f"<div class='hd' data-w='{watermark}'><div class='hm'>"
+        f"<div class='nm'><span class='on'>{_esc(title_cn)}</span></div>"
+        f"<div class='en' style='margin-top:4px'>{title_en}"
+        f"{f' · {stamp}' if stamp else ''}</div></div>"
+        f"<div class='hr'><b>PRTS // SCHEDULE</b><span>{_esc(badge)}</span></div></div>"
+        f"<div class='hz'></div>"
+    )
+    body = hdr + "<div class='bd'>" + "".join(sections) + "</div>"
+    return _doc(title_cn, body, ac, soft, width), width, max(380, est_h), complete

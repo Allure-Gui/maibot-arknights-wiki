@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "0.3.0"
+config_version = "0.3.1"
 
 [scope]
 # 群聊 / 私聊总开关（同时约束黑话感知 Hook、AI 工具与快捷指令）
@@ -36,7 +36,7 @@ admin_users = []
 
 [prts]
 api_url = "https://prts.wiki/api.php"
-user_agent = "MaiBot-ArknightsWiki/0.3.0 (+https://github.com/Allure-Gui/maibot-arknights-wiki)"
+user_agent = "MaiBot-ArknightsWiki/0.3.1 (+https://github.com/Allure-Gui/maibot-arknights-wiki)"
 timeout_seconds = 12.0
 min_request_interval_ms = 500
 # 立绘清晰度宽度上限（像素，1600 高清且原图≤3.5MB直出无损；0 表示始终原图）
@@ -51,6 +51,16 @@ auto_card_in_chat = true
 card_scale = 2.0
 # 发送完卡片图或立绘后立即结束本轮，不再追加多余文字
 stop_planner_after_image = true
+
+[reminder]
+# 开启后，在限时活动即将关闭时按设定时间自动推送到符合群聊黑/白名单的群聊（默认关闭）
+enable_event_reminder = false
+# 每日推送提醒的小时（北京时间 0~23，默认早上 9 点）
+reminder_hour = 9
+# 距离结束不足多少小时时触发提醒（默认 24 小时内，每期每群仅提醒一次）
+remind_before_hours = 24
+# 是否同时提醒即将结束的限时寻访卡池
+include_gacha = true
 
 [cache]
 # 页面 Wikitext 缓存有效期（小时）
