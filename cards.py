@@ -437,7 +437,7 @@ async def build_recruit_card_html(
         else:
             content_html = f"<div class='rl'>{''.join(_render_op(o) for o in ops)}</div>"
 
-        style = f"--rc:{rc}" if is_wide else f"--rc:{rc};flex:{grow} 1 0%"
+        style = f"--rc:{rc}" if is_wide else (f"--rc:{rc};flex:{grow} 1 0%" if grow > 0 else f"--rc:{rc};flex:0 1 auto")
         return (
             f"<div class='rb{' wide' if is_wide else ''}' style='{style}'>"
             f"<div class='rh'>{tag_html}</div>"
@@ -448,48 +448,47 @@ async def build_recruit_card_html(
         ops = c.get("operators") or []
         ops_n = len(ops)
         distinct_r = len({int(o.get("rarity") or 4) for o in ops})
-        ops_w = ops_n * 64 + max(0, distinct_r - 1) * 16 + 22
-        tags_w = sum(len(t) * 12 + 20 for t in (c.get("tags") or [])) + 48 + 22
+        sub_extra = (distinct_r * 20 + max(0, distinct_r - 1) * 10) if distinct_r > 1 else 0
+        ops_w = ops_n * 64 + sub_extra + 26
+        tags_w = sum(len(t) * 12 + 22 for t in (c.get("tags") or [])) + 26
         return max(ops_w, tags_w)
 
-    # 按保底星级档位分组（6★+ > 5★+ > 1★车 > 4★+），确保高星大组合绝不掉到低星下方；同档位内做紧凑行装箱
-    tier_order: list[int] = []
-    tier_buckets: dict[int, list[dict[str, Any]]] = {}
-    for c in combos:
-        sc = int(c.get("score") or 40)
-        if sc not in tier_buckets:
-            tier_order.append(sc)
-            tier_buckets[sc] = []
-        tier_buckets[sc].append(c)
-
+    # 保持 6★ > 5★ > 4★ > 1★ 严格先后顺序，按流式顺序装箱：
+    # - 大组合（>8人）独占整行；
+    # - 连续小组合（≤8人）自动从左到右同行紧凑拼排（不再因 5★/4★ 交界把单个 5★ 孤立撑满整行）；
+    # - 若某行最终仅剩 1 个较窄的小组合，则按内容自然宽度收紧，避免出现 1 人霸占整行黑洞。
     row_htmls: list[str] = []
     est_rows = 0
-    for sc in tier_order:
-        group = tier_buckets[sc]
-        compact_combos = [c for c in group if len(c.get("operators") or []) <= 8]
-        wide_combos = [c for c in group if len(c.get("operators") or []) > 8]
+    cur_row: list[tuple[dict[str, Any], int]] = []
 
-        packed_rows: list[list[tuple[dict[str, Any], int]]] = []
-        for c in compact_combos:
-            w_need = _est_box_w(c)
-            placed = False
-            for row in packed_rows:
-                used = sum(w for _, w in row) + 10 * len(row)
-                if used + w_need <= inner_w:
-                    row.append((c, w_need))
-                    placed = True
-                    break
-            if not placed:
-                packed_rows.append([(c, w_need)])
-
-        for row in packed_rows:
-            boxes_str = "".join(_render_combo_box(c, False, grow=max(1, w // 40)) for c, w in row)
+    def _flush_row() -> None:
+        nonlocal est_rows
+        if not cur_row:
+            return
+        if len(cur_row) == 1:
+            c0, w0 = cur_row[0]
+            # 单箱宽度超过容器 62% 时舒展铺满，否则按内容自然宽度收紧不拖长尾巴
+            grow0 = max(1, w0 // 40) if w0 >= int(inner_w * 0.62) else 0
+            row_htmls.append(f"<div class='rr'>{_render_combo_box(c0, False, grow=grow0)}</div>")
+        else:
+            boxes_str = "".join(_render_combo_box(c, False, grow=max(1, w // 40)) for c, w in cur_row)
             row_htmls.append(f"<div class='rr'>{boxes_str}</div>")
-            est_rows += 1
-        for c in wide_combos:
-            ops_n = len(c.get("operators") or [])
+        est_rows += 1
+        cur_row.clear()
+
+    for c in combos:
+        ops_n = len(c.get("operators") or [])
+        if ops_n > 8:
+            _flush_row()
             row_htmls.append(_render_combo_box(c, True))
             est_rows += 1 + (ops_n + per_row - 1) // per_row
+            continue
+        w_need = _est_box_w(c)
+        used = sum(w for _, w in cur_row) + 10 * len(cur_row)
+        if cur_row and used + w_need > inner_w:
+            _flush_row()
+        cur_row.append((c, w_need))
+    _flush_row()
 
     body = hdr + "<div class='bd'><div class='rg'>" + "".join(row_htmls) + "</div></div>"
     est_h = max(360, 190 + est_rows * 145)
