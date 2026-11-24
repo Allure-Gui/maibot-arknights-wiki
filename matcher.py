@@ -131,7 +131,8 @@ class ArknightsContextMatcher:
         add_entries(raw.get("tier1", {}), self._tier1)
         add_entries(raw.get("tier2", {}), self._tier2)
 
-        # 加载敌人/BOSS 黑话字典：专供 /方舟 敌人 精准解析，并按专有度并入聊天语境感知
+        # 加载敌人/BOSS 黑话字典：严格仅写入 _enemy_alias_lookup（专供 /方舟 敌人 使用），
+        # 绝不写入通用 _alias_lookup，彻底避免「海沫/哈洛德/国度」等与干员同名的敌人外号劫持 /立绘 或 /方舟 干员查询
         enemies_raw = raw.get("enemies", {})
         if isinstance(enemies_raw, dict):
             for k, v in enemies_raw.items():
@@ -142,12 +143,11 @@ class ArknightsContextMatcher:
                 target = str(v[0]).strip()
                 brief = str(v[1]).strip() if len(v) > 1 else ""
                 self._enemy_alias_lookup[key_lower] = (target, brief)
-                # 不覆盖已有干员词条；未冲突的敌人词按字长分级并入语境感知（>=4字专有词进 tier1，短词进 tier2 防误触）
+                # 仅在语境感知（聊天小抄）中按字长分级注入未冲突的敌人词，不碰 _alias_lookup
                 if key_lower not in custom_keys and key_lower not in self._alias_lookup:
                     is_ascii = bool(_ASCII_WORD_RE.fullmatch(key_lower))
                     bucket = self._tier1 if (not is_ascii and len(term) >= 4) else self._tier2
                     bucket.append((term, target, brief, is_ascii))
-                    self._alias_lookup[key_lower] = (target, brief)
 
         for alias, target, brief, is_ascii in custom_parsed:
             key_lower = alias.lower()
