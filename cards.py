@@ -682,3 +682,133 @@ async def build_events_card_html(
     )
     body = hdr + "<div class='bd'>" + "".join(sections) + "</div>"
     return _doc(title_cn, body, ac, soft, width), width, max(380, est_h), complete
+
+
+async def build_material_summary_card_html(
+    prts: PRTSClient,
+    data: dict[str, Any],
+) -> tuple[str, int, int, bool]:
+    """构建黑曜石金箔风格「养成材料总账」卡片（真实带框材料图标 + 范围胶囊 + 龙门币置顶），返回 (html, width, est_height, complete)。"""
+    op: dict[str, Any] = data["op"]
+    included: list[str] = list(data.get("included") or [])
+    lmb: int = int(data.get("lmb") or 0)
+    items: list[tuple[str, int]] = list(data.get("items") or [])
+
+    ac, soft = _PALETTE.get(_stars(op), _PALETTE[6])
+    name = op["name"]
+    av = [f"头像_{name}_2.png", f"头像_{name}.png"]
+
+    # 龙门币置顶进图标网格（格式化为 18w / 24.5w），其余按数量降序
+    display_items: list[tuple[str, str]] = []
+    if lmb > 0:
+        if lmb >= 10000:
+            w_val = lmb / 10000
+            lmb_lbl = f"{int(w_val)}w" if lmb % 10000 == 0 else f"{w_val:.1f}w"
+        else:
+            lmb_lbl = str(lmb)
+        display_items.append(("龙门币", lmb_lbl))
+    for mat_name, cnt in items:
+        display_items.append((mat_name, str(cnt)))
+
+    need = list(av) + list(dict.fromkeys(f"道具_带框_{m}.png" for m, _ in display_items))
+    uris, complete = await prts.fetch_file_data_uris(need, thumb_width=160)
+    icons = _Icons(uris)
+    av_uri = uris.get(av[0]) or uris.get(av[1]) or ""
+
+    scope_pills = "".join(f"<span class='t b'>{_esc(x)}</span>" for x in included)
+    if lmb > 0:
+        scope_pills += f"<span class='t a'>龙门币 {lmb:,}</span>"
+    scope_bar = f"<div class='tg' style='margin:0 0 12px'>{scope_pills}</div>" if scope_pills else ""
+
+    mat_grid = _mats(display_items, icons)
+    sec_hint = f"TOTAL · {len(display_items)} ITEMS"
+    sec = _sec("01", "养成素材合计", sec_hint, scope_bar + mat_grid)
+
+    tip = (
+        "<div class='tp' style='margin-top:10px;padding:8px 12px'>"
+        "<span class='tp-b'>范围筛选</span>"
+        "<span style='font-size:11px;color:#aeb7c6'>支持按阶段自由组合 · 例：/方舟 总计 维什戴尔 精二 三技能 模组</span>"
+        "</div>"
+    )
+    width = 660
+    rows_n = max(1, (len(display_items) + 7) // 8)
+    est_h = 300 + rows_n * 102
+    body = _hdr(op, "养成材料总账", av_uri) + "<div class='bd'>" + sec + tip + "</div>"
+    return _doc(f"{name} 养成材料总账", body, ac, soft, width, icons.css), width, est_h, complete
+
+
+async def build_voice_card_html(
+    prts: PRTSClient,
+    data: dict[str, Any],
+) -> tuple[str, int, int, bool]:
+    """构建黑曜石金箔风格「干员语音记录」卡片（纯文字台词彩蛋），返回 (html, width, est_height, complete)。"""
+    op: dict[str, Any] = data["op"]
+    entries: list[tuple[str, str]] = list(data.get("entries") or [])
+    kw = str(data.get("keyword") or "").strip()
+
+    ac, soft = _PALETTE.get(_stars(op), _PALETTE[6])
+    name = op["name"]
+    av = [f"头像_{name}_2.png", f"头像_{name}.png"]
+    uris, complete = await prts.fetch_file_data_uris(av, thumb_width=160)
+    av_uri = uris.get(av[0]) or uris.get(av[1]) or ""
+
+    cards_html = "".join(
+        f"<div class='sk'>"
+        f"<div class='sh'><span class='sn'>{_esc(lbl)}</span>"
+        f"<div class='sp'><span class='p g'>中文台词</span></div></div>"
+        f"<div class='sd'>「{_esc(txt)}」</div></div>"
+        for lbl, txt in entries
+    )
+    sec_title = f"语音记录 · {kw}" if kw else "精选语音台词"
+    sec = _sec("01", sec_title, f"VOICE LINES · {len(entries)}", cards_html)
+    tip = (
+        "<div class='tp' style='margin-top:10px;padding:8px 12px'>"
+        "<span class='tp-b'>仅文字无语音</span>"
+        "<span style='font-size:11px;color:#aeb7c6'>支持关键词：戳一戳 · 信赖 · 交谈 · 问候 · 报到 · 随机</span>"
+        "</div>"
+    )
+    width = 660
+    est_h = 260 + sum(95 + (len(t) // 36) * 20 for _, t in entries)
+    body = _hdr(op, "干员语音记录", av_uri) + "<div class='bd'>" + sec + tip + "</div>"
+    return _doc(f"{name} 语音记录", body, ac, soft, width), width, max(340, est_h), complete
+
+
+async def build_lore_card_html(
+    prts: PRTSClient,
+    data: dict[str, Any],
+) -> tuple[str, int, int, bool]:
+    """构建黑曜石金箔风格「干员机密档案」卡片，返回 (html, width, est_height, complete)。"""
+    op: dict[str, Any] = data["op"]
+    profile: list[tuple[str, str]] = list(data.get("profile") or [])
+    entries: list[tuple[str, str]] = list(data.get("entries") or [])
+
+    ac, soft = _PALETTE.get(_stars(op), _PALETTE[6])
+    name = op["name"]
+    av = [f"头像_{name}_2.png", f"头像_{name}.png"]
+    uris, complete = await prts.fetch_file_data_uris(av, thumb_width=160)
+    av_uri = uris.get(av[0]) or uris.get(av[1]) or ""
+
+    parts: list[str] = []
+    if profile:
+        pills = "".join(
+            f"<span class='t{' a' if k == '感染情况' else ''}'>{_esc(k)} · {_esc(v)}</span>"
+            for k, v in profile
+        )
+        parts.append(_sec("01", "基础履历", "PROFILE", f"<div class='tg' style='margin:0'>{pills}</div>"))
+
+    story_cards: list[str] = []
+    for heading, raw_body in entries:
+        trimmed = raw_body if len(raw_body) <= 280 else raw_body[:276].rstrip() + "…"
+        story_cards.append(
+            f"<div class='sk'>"
+            f"<div class='sh'><span class='sn'>{_esc(heading)}</span></div>"
+            f"<div class='sd'>{_esc(trimmed)}</div></div>"
+        )
+    if story_cards:
+        idx = f"{len(parts) + 1:02d}"
+        parts.append(_sec(idx, "机密档案与记录", "ARCHIVE FILES", "".join(story_cards)))
+
+    width = 680
+    est_h = 260 + (90 if profile else 0) + sum(100 + (min(len(b), 280) // 36) * 20 for _, b in entries)
+    body = _hdr(op, "干员机密档案", av_uri) + "<div class='bd'>" + "".join(parts) + "</div>"
+    return _doc(f"{name} 机密档案", body, ac, soft, width), width, max(360, est_h), complete

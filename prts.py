@@ -1442,11 +1442,11 @@ class PRTSClient:
         except ValueError:
             return 0
 
-    async def query_material_summary(self, target: str, detail: str = "") -> str:
-        """一键汇总干员养成材料总账（支持按 精二 / 1~7级 / 一二三技能专三 / 模组 自由组合）。"""
+    async def get_material_summary_struct(self, target: str, detail: str = "") -> dict[str, Any]:
+        """一键汇总干员养成材料总账结构化数据（支持按 精二 / 1~7级 / 一二三技能专三 / 模组 自由组合）。"""
         op = await self.get_operator_struct(target)
         if not op:
-            return f"未找到干员「{target}」的养成材料数据。"
+            return {"ok": False, "error": f"未找到干员「{target}」的养成材料数据。"}
 
         focus = (detail or "").strip().lower()
         has_elite = any(k in focus for k in ("精一", "精二", "精1", "精2", "精英"))
@@ -1495,7 +1495,6 @@ class PRTSClient:
 
         if default_all or has_mod:
             mods = op.get("modules") or []
-            # 若未指定多个模组且处于默认全量模式，默认只汇总第 1 个常用模组避免重复叠加
             target_mods = mods[:1] if (default_all and len(mods) > 1 and "全模组" not in focus) else mods
             for m in target_mods:
                 for st in m.get("stages") or []:
@@ -1505,11 +1504,26 @@ class PRTSClient:
                     included.append(f"模组{mtype}Lv.1~3")
 
         if not totals:
-            return f"未找到「{op['name']}」对应范围的材料数据。"
+            return {"ok": False, "error": f"未找到「{op['name']}」对应范围的材料数据。"}
 
-        # 龙门币置顶，其余按数量降序排列
         lmb = totals.pop("龙门币", 0)
         sorted_items = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+        return {
+            "ok": True,
+            "op": op,
+            "included": included,
+            "lmb": lmb,
+            "items": sorted_items,
+        }
+
+    def format_material_summary_text(self, data: dict[str, Any]) -> str:
+        """将养成材料总账结构化数据格式化为纯文本（降级兜底或无图平台使用）。"""
+        if not data.get("ok"):
+            return str(data.get("error") or "未找到养成材料总账数据。")
+        op = data["op"]
+        included = data.get("included") or []
+        lmb = int(data.get("lmb") or 0)
+        sorted_items = data.get("items") or []
         lines = [
             f"【{op['name']} · 养成材料总账】",
             f"统计范围：{' + '.join(included)}",
@@ -1522,18 +1536,92 @@ class PRTSClient:
         lines.append("（提示：可指定范围，如 /方舟 总计 维什戴尔 精二 三技能 模组）")
         return "\n".join(lines)
 
-    async def query_voice_lines(self, target: str, keyword: str = "") -> str:
-        """查询干员中文语音台词彩蛋（仅缓存纯文本，不下载音频）。"""
-        title = await self.resolve_title(target)
+    async def query_material_summary(self, target: str, detail: str = "") -> str:
+        """一键汇总干员养成材料总账（支持按 精二 / 1~7级 / 一二三技能专三 / 模组 自由组合）。"""
+        data = await self.get_material_summary_struct(target, detail=detail)
+        return self.format_material_summary_text(data)
+
+    async def get_operator_lore_struct(self, target: str, detail: str = "") -> dict[str, Any]:
+        """提取干员机密档案结构化数据（基本资料 + 履历/档案资料/模组故事）。"""
+        op = await self.get_operator_struct(target)
+        if not op:
+            return {"ok": False, "error": f"未找到干员「{target}」的档案数据。"}
+        fetched = await self.fetch_wikitext(op["name"])
+        if not fetched:
+            return {"ok": False, "error": f"未获取到「{op['name']}」的档案正文。"}
+        wikitext, _ = fetched
+        sections = split_sections(wikitext)
+        lore_sec = sections.get("干员档案", "")
+        if not lore_sec:
+            return {"ok": False, "error": f"「{op['name']}」暂未收录干员档案段落。"}
+
+        profile: list[tuple[str, str]] = []
+        profile_tpls = extract_templates(lore_sec, {"人员档案set"})
+        if profile_tpls:
+            pp = parse_template_params(profile_tpls[0][1])
+            for k, lbl in (
+                ("性别", "性别"),
+                ("种族", "种族"),
+                ("出身地", "出身"),
+                ("身高", "身高"),
+                ("生日", "生日"),
+                ("战斗经验", "战斗经验"),
+                ("矿石病感染情况", "感染情况"),
+            ):
+                val = clean_wiki_text(pp.get(k, "")).strip()
+                if val:
+                    profile.append((lbl, val))
+
+        archive_entries: list[tuple[str, str]] = []
+        for _, inn in extract_templates(lore_sec, {"人员档案", "干员档案"}):
+            ap = parse_template_params(inn)
+            for idx in range(1, 15):
+                heading = clean_wiki_text(ap.get(f"档案{idx}", "")).strip()
+                body = clean_wiki_text(ap.get(f"档案{idx}文本", "")).strip()
+                if not body:
+                    continue
+                if not detail.strip() and heading in ("基础档案", "综合体检测试"):
+                    continue
+                archive_entries.append((heading or f"档案{idx}", body))
+
+        for _, inn in extract_templates(wikitext, {"模组"}):
+            mp = parse_template_params(inn)
+            if mp.get("基础证章", "").lower() in ("yes", "1", "true") or mp.get("类型图标") == "original":
+                continue
+            story = clean_wiki_text(mp.get("基础信息", "")).strip()
+            if story:
+                mname = clean_wiki_text(mp.get("名称", "")).strip()
+                archive_entries.append((f"模组故事 · {mname}", story))
+
+        if detail.strip():
+            kw = detail.strip().lower()
+            matched = [(h, b) for h, b in archive_entries if kw in h.lower() or kw in b.lower()]
+            chosen = matched or archive_entries
+        else:
+            chosen = archive_entries
+
+        if not profile and not chosen:
+            return {"ok": False, "error": f"暂未解析到「{op['name']}」的详细档案。"}
+        return {
+            "ok": True,
+            "op": op,
+            "profile": profile,
+            "entries": chosen[:4],
+            "detail": detail.strip(),
+        }
+
+    async def get_voice_lines_struct(self, target: str, keyword: str = "") -> dict[str, Any]:
+        """查询干员中文语音台词结构化数据（仅文本，不下载音频）。"""
+        op = await self.get_operator_struct(target)
+        title = op["name"] if op else (await self.resolve_title(target))
         if not title:
-            return f"未找到干员「{target}」。"
+            return {"ok": False, "error": f"未找到干员「{target}」。"}
         voice_page = f"{title}/语音记录"
         fetched = await self.fetch_wikitext(voice_page)
         if not fetched:
-            return f"未在 PRTS 找到「{title}」的语音记录。"
+            return {"ok": False, "error": f"未在 PRTS 找到「{title}」的语音记录。"}
         wikitext, _ = fetched
 
-        # 提取 |标题N=... 与对应 |台词N={{VoiceData/word|中文|...}}
         titles_map: dict[str, str] = {}
         for m in re.finditer(r"\|\s*标题(\d+)\s*=\s*([^\n|]+)", wikitext):
             titles_map[m.group(1)] = clean_wiki_text(m.group(2)).strip()
@@ -1552,7 +1640,7 @@ class PRTSClient:
             entries.append((label, line_txt))
 
         if not entries:
-            return f"暂未解析到「{title}」的中文台词。"
+            return {"ok": False, "error": f"暂未解析到「{title}」的中文台词。"}
 
         kw = (keyword or "").strip().lower()
         kw_alias = {
@@ -1565,19 +1653,17 @@ class PRTSClient:
             "报到": "干员报到",
         }
         kw_eff = kw_alias.get(kw, kw)
-        if kw in ("随机", "random", "来一句"):
+        is_random = kw in ("随机", "random", "来一句")
+        if is_random:
             import random
-            lbl, txt = random.choice(entries)
-            return f"【{title} · {lbl}】\n「{txt}」"
-
-        if kw_eff:
+            picked = [random.choice(entries)]
+        elif kw_eff:
             matched = [(lbl, txt) for lbl, txt in entries if kw_eff in lbl.lower() or kw_eff in txt.lower()]
             if not matched:
                 sample_labels = "、".join(lbl for lbl, _ in entries[:10])
-                return f"未在「{title}」台词中找到「{keyword}」。常见分类：{sample_labels}"
-            picked = matched[:3]
+                return {"ok": False, "error": f"未在「{title}」台词中找到「{keyword}」。常见分类：{sample_labels}"}
+            picked = matched[:4]
         else:
-            # 默认挑 3 条高互动经典台词
             prefer = ("戳一下", "信赖触摸", "问候", "交谈1", "信赖提升后交谈1", "任命助理", "标题")
             picked = []
             for pf in prefer:
@@ -1590,10 +1676,33 @@ class PRTSClient:
             if not picked:
                 picked = entries[:3]
 
+        return {
+            "ok": True,
+            "title": title,
+            "op": op or {"name": title, "stars": 6},
+            "entries": picked,
+            "keyword": keyword.strip(),
+            "is_random": is_random,
+        }
+
+    def format_voice_lines_text(self, data: dict[str, Any]) -> str:
+        """将干员语音台词结构化数据格式化为纯文本（降级兜底或无图平台使用）。"""
+        if not data.get("ok"):
+            return str(data.get("error") or "未找到语音台词。")
+        title = data.get("title") or data["op"]["name"]
+        picked = data.get("entries") or []
+        if data.get("is_random") and len(picked) == 1:
+            lbl, txt = picked[0]
+            return f"【{title} · {lbl}】\n「{txt}」"
         out = [f"【{title} · 语音台词】"]
         for lbl, txt in picked:
             out.append(f"• {lbl}：「{txt}」")
         return "\n".join(out)
+
+    async def query_voice_lines(self, target: str, keyword: str = "") -> str:
+        """查询干员中文语音台词彩蛋（仅缓存纯文本，不下载音频）。"""
+        data = await self.get_voice_lines_struct(target, keyword=keyword)
+        return self.format_voice_lines_text(data)
 
     async def get_current_events_struct(self) -> dict[str, Any]:
         """通过 PRTS Semantic MediaWiki ask 接口获取国服当前活动与寻访卡池结构化数据（2 小时缓存，倒计时实时计算）。"""

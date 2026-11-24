@@ -29,8 +29,11 @@ from .cards import (
     build_enemy_card_html,
     build_events_card_html,
     build_help_card_html,
+    build_lore_card_html,
+    build_material_summary_card_html,
     build_operator_card_html,
     build_recruit_card_html,
+    build_voice_card_html,
 )
 from .matcher import (
     ArknightsContextMatcher,
@@ -1320,6 +1323,174 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         label = "已发送当期寻访卡池" if focus == "gacha" else "已发送当期活动"
         return await self._command_reply(stream_id, reply, label, platform=platform)
 
+    async def _send_summary_card_or_text(
+        self,
+        stream_id: str,
+        target: str,
+        detail: str = "",
+        *,
+        platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """汇总干员养成材料总账；优先发黑曜石金箔总账卡片图，不可用时自动降级纯文本。"""
+        if not self._prts or not self.ctx:
+            return False, "", 0
+        try:
+            data = await self._prts.get_material_summary_struct(target, detail=detail)
+        except Exception as exc:
+            return await self._command_reply(stream_id, f"计算材料总账失败：{_exc_text(exc)}", "计算材料总账失败", platform=platform)
+
+        if not data.get("ok"):
+            return await self._command_reply(stream_id, str(data.get("error") or "未找到养成材料总账数据。"), "未找到材料总账", platform=platform)
+
+        op_name = data["op"]["name"]
+        if self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                try:
+                    now = time.time()
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    ckey = ("__summary__", op_name, "|".join(data.get("included") or []), scale)
+                    hit = self._card_png.get(ckey)
+                    if hit and now - hit[0] < 3600.0:
+                        b64 = hit[1]
+                    else:
+                        html_str, vp_w, vp_h, complete = await build_material_summary_card_html(self._prts, data)
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": max(340, vp_h)},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=15000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64 and complete:
+                            self._card_png[ckey] = (now, str(b64))
+                            while len(self._card_png) > 24:
+                                self._card_png.pop(next(iter(self._card_png)))
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        return True, f"已发送 {op_name} 材料总账卡", 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 材料总账卡片渲染失败（已降级纯文本）: {_exc_text(exc)}")
+
+        return await self._command_reply(
+            stream_id, self._prts.format_material_summary_text(data), f"已发送 {op_name} 材料总账", platform=platform,
+        )
+
+    async def _send_voice_card_or_text(
+        self,
+        stream_id: str,
+        target: str,
+        keyword: str = "",
+        *,
+        platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """查询干员中文语音台词；优先发黑曜石金箔语音记录卡（纯文字台词），不可用时自动降级纯文本。"""
+        if not self._prts or not self.ctx:
+            return False, "", 0
+        try:
+            data = await self._prts.get_voice_lines_struct(target, keyword=keyword)
+        except Exception as exc:
+            return await self._command_reply(stream_id, f"查询干员语音失败：{_exc_text(exc)}", "查询语音失败", platform=platform)
+
+        if not data.get("ok"):
+            return await self._command_reply(stream_id, str(data.get("error") or "未找到干员语音记录。"), "未找到语音", platform=platform)
+
+        op_name = data["op"]["name"]
+        is_random = bool(data.get("is_random"))
+        if self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                try:
+                    now = time.time()
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    ckey = ("__voice__", op_name, str(keyword or "").strip().lower(), scale)
+                    hit = None if is_random else self._card_png.get(ckey)
+                    if hit and now - hit[0] < 3600.0:
+                        b64 = hit[1]
+                    else:
+                        html_str, vp_w, vp_h, complete = await build_voice_card_html(self._prts, data)
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": max(340, vp_h)},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=15000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64 and complete and not is_random:
+                            self._card_png[ckey] = (now, str(b64))
+                            while len(self._card_png) > 24:
+                                self._card_png.pop(next(iter(self._card_png)))
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        return True, f"已发送 {op_name} 语音记录卡", 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 语音卡片渲染失败（已降级纯文本）: {_exc_text(exc)}")
+
+        return await self._command_reply(
+            stream_id, self._prts.format_voice_lines_text(data), f"已发送 {op_name} 语音台词", platform=platform,
+        )
+
+    async def _send_lore_card_or_text(
+        self,
+        stream_id: str,
+        target: str,
+        detail: str = "",
+        *,
+        platform: str = "",
+    ) -> tuple[bool, str, int]:
+        """查询干员机密档案；优先发黑曜石金箔档案卡，不可用或非干员时自动降级纯文本。"""
+        if not self._prts or not self.ctx:
+            return False, "", 0
+        try:
+            data = await self._prts.get_operator_lore_struct(target, detail=detail)
+        except Exception:
+            data = {"ok": False}
+
+        if data.get("ok") and self.cfg.render.enable_cards and not self._platform_no_image(platform):
+            render = getattr(self.ctx, "render", None)
+            if render is not None:
+                op_name = data["op"]["name"]
+                try:
+                    now = time.time()
+                    scale = float(self.cfg.render.card_scale or 2.0)
+                    ckey = ("__lore__", op_name, str(detail or "").strip().lower(), scale)
+                    hit = self._card_png.get(ckey)
+                    if hit and now - hit[0] < 3600.0:
+                        b64 = hit[1]
+                    else:
+                        html_str, vp_w, vp_h, complete = await build_lore_card_html(self._prts, data)
+                        res = await render.html2png(
+                            html_str,
+                            selector=".card",
+                            viewport={"width": vp_w + 40, "height": max(360, vp_h)},
+                            device_scale_factor=scale,
+                            omit_background=True,
+                            wait_until="domcontentloaded",
+                            allow_network=False,
+                            render_timeout_ms=15000,
+                        )
+                        b64 = res.get("image_base64") if isinstance(res, dict) else None
+                        if b64 and complete:
+                            self._card_png[ckey] = (now, str(b64))
+                            while len(self._card_png) > 24:
+                                self._card_png.pop(next(iter(self._card_png)))
+                    if b64 and _send_ok(await self.ctx.send.image(str(b64), stream_id=stream_id)):
+                        return True, f"已发送 {op_name} 机密档案卡", 2
+                except Exception as exc:
+                    self.ctx.logger.warning(f"[明日方舟wiki插件] 档案卡片渲染失败（已降级纯文本）: {_exc_text(exc)}")
+
+        try:
+            reply = await self._prts.query_wiki(target=target, section="lore", detail=detail)
+        except Exception as exc:
+            reply = f"查询干员档案失败：{_exc_text(exc)}"
+        return await self._command_reply(stream_id, reply, "已发送干员档案", platform=platform)
+
     @staticmethod
     def _extract_image_and_reply_from_msg(msg: Any) -> tuple[str, str]:
         """从消息字典/对象中递归提取第一张图片（data URI / base64 / URL）以及引用消息 ID。"""
@@ -1553,13 +1724,14 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         if len(text) > 1200:
             text = text[:1185].rstrip() + "\n…（内容过长已精简）"
 
-        # 决定是否附发 2x 高清战术卡片图（聊天查材料/模组/敌人/活动卡池默认开启，不支持发图平台自动跳过）
+        # 决定是否附发 2x 高清战术卡片图（聊天查材料/模组/总账/敌人/活动卡池默认开启，不支持发图平台自动跳过）
         is_enemy_sec = sec in ("enemy", "boss", "敌人", "领袖")
         is_events_sec = sec in ("events", "event", "活动", "卡池", "寻访", "gacha", "pool")
+        is_summary_sec = sec in ("summary", "总计", "汇总", "总账")
         want_card = (
             bool(send_card)
             if send_card is not None
-            else (self.cfg.render.auto_card_in_chat and (sec in ("materials", "modules") or is_enemy_sec or is_events_sec))
+            else (self.cfg.render.auto_card_in_chat and (sec in ("materials", "modules") or is_summary_sec or is_enemy_sec or is_events_sec))
         )
         card_sent = False
         if want_card and stream_id and not self._platform_no_image(plat):
@@ -1570,6 +1742,19 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 if (now - self._recent_cards.get(dedup_key, 0.0)) >= 15.0:
                     ok_ev, _, _ = await self._send_events_card_or_text(stream_id, focus=ev_focus, platform=plat)
                     if ok_ev:
+                        self._recent_cards[dedup_key] = now
+                        card_sent = True
+            elif is_summary_sec:
+                dedup_key = (stream_id, "__summary__", f"{str(target).strip()}|{str(detail or '').strip()}")
+                now = time.time()
+                if (now - self._recent_cards.get(dedup_key, 0.0)) >= 15.0:
+                    ok_s, _, _ = await self._send_summary_card_or_text(
+                        stream_id=stream_id,
+                        target=str(target).strip(),
+                        detail=str(detail or ""),
+                        platform=plat,
+                    )
+                    if ok_s:
                         self._recent_cards[dedup_key] = now
                         card_sent = True
             elif is_enemy_sec:
@@ -1910,18 +2095,10 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             return await self._send_enemy_card_or_text(stream_id, parts[1], detail=" ".join(parts[2:]), platform=plat)
 
         if p0 in ("总计", "汇总", "总账", "缺口", "summary") and len(parts) >= 2:
-            try:
-                reply = await self._prts.query_material_summary(parts[1], detail=" ".join(parts[2:]))
-            except Exception as exc:
-                reply = f"计算材料总账失败：{_exc_text(exc)}"
-            return await self._command_reply(stream_id, reply, "已发送材料总账", platform=plat)
+            return await self._send_summary_card_or_text(stream_id, parts[1], detail=" ".join(parts[2:]), platform=plat)
 
         if p0 in ("语音", "台词", "voice") and len(parts) >= 2:
-            try:
-                reply = await self._prts.query_voice_lines(parts[1], keyword=" ".join(parts[2:]))
-            except Exception as exc:
-                reply = f"查询干员语音失败：{_exc_text(exc)}"
-            return await self._command_reply(stream_id, reply, "已发送干员语音台词", platform=plat)
+            return await self._send_voice_card_or_text(stream_id, parts[1], keyword=" ".join(parts[2:]), platform=plat)
 
         # 只打了子命令、没带干员：直接给用法，别掉到词条检索里回一句「没找到『总计』」
         if p0 in ("总计", "汇总", "总账", "缺口", "summary"):
@@ -1952,6 +2129,13 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 detail = " ".join(parts[1:] if p2 == "精二" else parts[2:])
             else:
                 detail = " ".join(parts[1:])
+
+        if section == "summary":
+            return await self._send_summary_card_or_text(stream_id, target, detail=detail, platform=plat)
+        if section == "voice":
+            return await self._send_voice_card_or_text(stream_id, target, keyword=detail, platform=plat)
+        if section == "lore":
+            return await self._send_lore_card_or_text(stream_id, target, detail=detail, platform=plat)
 
         # 对干员总览/技能/模组/材料优先发 2x 高清黑曜石金箔风格卡片图；不可用或非干员自动无缝降级纯文本
         if section in ("overview", "skills", "modules", "materials") and not self._platform_no_image(plat):
