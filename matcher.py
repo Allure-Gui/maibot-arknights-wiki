@@ -93,6 +93,8 @@ class ArknightsContextMatcher:
         self._tier1: list[tuple[str, str, str, bool]] = []
         self._tier2: list[tuple[str, str, str, bool]] = []
         self._alias_lookup: dict[str, tuple[str, str]] = {}
+        self._enemy_alias_lookup: dict[str, tuple[str, str]] = {}
+        self._custom_alias_lookup: dict[str, tuple[str, str]] = {}
         self._load(glossary_path, custom_aliases or ())
 
     def _load(self, glossary_path: Path, custom_aliases: Sequence[str]) -> None:
@@ -129,6 +131,24 @@ class ArknightsContextMatcher:
         add_entries(raw.get("tier1", {}), self._tier1)
         add_entries(raw.get("tier2", {}), self._tier2)
 
+        # 加载敌人/BOSS 黑话字典：专供 /方舟 敌人 精准解析，并按专有度并入聊天语境感知
+        enemies_raw = raw.get("enemies", {})
+        if isinstance(enemies_raw, dict):
+            for k, v in enemies_raw.items():
+                term = str(k).strip()
+                if not term or not isinstance(v, list) or not v:
+                    continue
+                key_lower = term.lower()
+                target = str(v[0]).strip()
+                brief = str(v[1]).strip() if len(v) > 1 else ""
+                self._enemy_alias_lookup[key_lower] = (target, brief)
+                # 不覆盖已有干员词条；未冲突的敌人词按字长分级并入语境感知（>=4字专有词进 tier1，短词进 tier2 防误触）
+                if key_lower not in custom_keys and key_lower not in self._alias_lookup:
+                    is_ascii = bool(_ASCII_WORD_RE.fullmatch(key_lower))
+                    bucket = self._tier1 if (not is_ascii and len(term) >= 4) else self._tier2
+                    bucket.append((term, target, brief, is_ascii))
+                    self._alias_lookup[key_lower] = (target, brief)
+
         for alias, target, brief, is_ascii in custom_parsed:
             key_lower = alias.lower()
             if self.custom_alias_force_tier1:
@@ -137,6 +157,7 @@ class ArknightsContextMatcher:
                 bucket = self._tier1 if (not is_ascii and len(alias) >= 2) or (is_ascii and len(alias) >= 3) else self._tier2
             bucket.append((alias, target, brief, is_ascii))
             self._alias_lookup[key_lower] = (target, brief)
+            self._custom_alias_lookup[key_lower] = (target, brief)
 
         # 按词长降序，优先匹配长词避免短词遮蔽（如 "42姐" 优先于 "42"）
         self._tier1.sort(key=lambda x: len(x[0]), reverse=True)
@@ -148,6 +169,13 @@ class ArknightsContextMatcher:
         if not key:
             return None
         return self._alias_lookup.get(key)
+
+    def resolve_enemy_alias(self, query: str) -> tuple[str, str] | None:
+        """优先从自定义别称与敌人/BOSS 黑话词典解析精确 PRTS 敌方页面标题。"""
+        key = str(query or "").strip().lower()
+        if not key:
+            return None
+        return self._custom_alias_lookup.get(key) or self._enemy_alias_lookup.get(key)
 
     def is_session_hot(self, session_id: str) -> bool:
         """判断会话是否处于方舟讨论热态窗口内。"""

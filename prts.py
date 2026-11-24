@@ -2009,12 +2009,14 @@ class PRTSClient:
                 is_robot = "支援机械" in comb or not non_1
                 if is_robot:
                     min_r = 1
-                    score = 45
+                    score = 10
                 else:
                     min_r = min(non_1)
                     score = min_r * 10
                 if min_r >= 4 or is_robot:
-                    matched_sorted = sorted(matched, key=lambda x: (-x["rarity"], x["name"]))
+                    # 9:00 高星招募不会出 1★ 小车；非支援机械组合自动排除 1★ 避免误混
+                    eff_ops = matched if is_robot else [o for o in matched if o["rarity"] >= 2]
+                    matched_sorted = sorted(eff_ops, key=lambda x: (-x["rarity"], x["name"]))
                     combos.append({
                         "tags": list(comb),
                         "min_rarity": min_r,
@@ -2070,12 +2072,15 @@ class PRTSClient:
         wikitext = ""
         title = ""
 
-        # 优先尝试解析标题；若命中干员页则自动尝试「xxx(敌方)」或搜索敌方词条
+        # 优先尝试敌人黑话词典（如 大爹/红刀哥/黑蛇/内卫/蒸汽骑士/大特/老登/高速公鹿），再尝试通用解析与「xxx(敌方)」
         cand_titles: list[str] = []
+        enemy_alias = self.matcher.resolve_enemy_alias(q)
+        if enemy_alias and enemy_alias[0]:
+            cand_titles.append(enemy_alias[0])
         resolved = await self.resolve_title(q)
-        if resolved:
+        if resolved and resolved not in cand_titles:
             cand_titles.append(resolved)
-        if not q.endswith("(敌方)"):
+        if not q.endswith("(敌方)") and f"{q}(敌方)" not in cand_titles:
             cand_titles.append(f"{q}(敌方)")
         if resolved and not resolved.endswith("(敌方)") and f"{resolved}(敌方)" not in cand_titles:
             cand_titles.append(f"{resolved}(敌方)")

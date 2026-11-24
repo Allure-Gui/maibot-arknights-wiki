@@ -397,60 +397,99 @@ async def build_recruit_card_html(
         ops = c.get("operators") or []
         is_robot = bool(c.get("is_robot"))
         min_r = int(c.get("min_rarity") or 4)
+        max_r = max((int(o.get("rarity") or min_r) for o in ops), default=min_r)
         rc = _PALETTE.get(1 if is_robot else min_r, _PALETTE[4])[0]
-        badge = "1★车" if is_robot else f"{min_r}★+"
+        if is_robot:
+            badge = "1★车"
+        elif max_r > min_r:
+            badge = f"{min_r}-{max_r}★"
+        else:
+            badge = f"{min_r}★"
         tag_html = "".join(f"<span class='rt'>{_esc(t)}</span>" for t in (c.get("tags") or []))
-        op_cards: list[str] = []
-        for o in ops:
+        def _render_op(o: dict[str, Any]) -> str:
             oname = o["name"]
             orarity = max(1, min(6, int(o.get("rarity") or 4)))
             oc = _PALETTE.get(orarity, _PALETTE[4])[0]
             cls = op_cls_map.get(oname)
             face = f"<i class='{cls}'></i>" if cls else f"<b>{_esc(oname[:3])}</b>"
-            op_cards.append(
-                f"<div class='ro'><div class='rp' style='--oc:{oc}'>{face}</div>"
+            return (
+                f"<div class='ro'><div class='rp' style='--oc:{oc}'>{face}<em>{orarity}★</em></div>"
                 f"<div class='rn'>{_esc(oname)}</div></div>"
             )
+
+        # 按星级降序分组；若包含多个星级，则左右分成独立子区（如左侧 5★、右侧 4★），各自带星级标题
+        rarity_groups: dict[int, list[dict[str, Any]]] = {}
+        for o in ops:
+            r_val = max(1, min(6, int(o.get("rarity") or 4)))
+            rarity_groups.setdefault(r_val, []).append(o)
+
+        if len(rarity_groups) > 1:
+            sub_htmls: list[str] = []
+            for r_val in sorted(rarity_groups.keys(), reverse=True):
+                g_ops = rarity_groups[r_val]
+                sc_col = _PALETTE.get(r_val, _PALETTE[4])[0]
+                sub_cards = "".join(_render_op(o) for o in g_ops)
+                sub_htmls.append(
+                    f"<div class='rsub' style='--sc:{sc_col}'>"
+                    f"<div class='rl'>{sub_cards}</div></div>"
+                )
+            content_html = f"<div class='rsubs'>{''.join(sub_htmls)}</div>"
+        else:
+            content_html = f"<div class='rl'>{''.join(_render_op(o) for o in ops)}</div>"
+
         style = f"--rc:{rc}" if is_wide else f"--rc:{rc};flex:{grow} 1 0%"
         return (
             f"<div class='rb{' wide' if is_wide else ''}' style='{style}'>"
-            f"<div class='rh'>{tag_html}<span class='rq'>{badge}</span></div>"
-            f"<div class='rl'>{''.join(op_cards)}</div></div>"
+            f"<div class='rh'>{tag_html}</div>"
+            f"{content_html}</div>"
         )
 
     def _est_box_w(c: dict[str, Any]) -> int:
-        ops_n = len(c.get("operators") or [])
-        ops_w = ops_n * 64 + 22
-        tags_w = sum(len(t) * 12 + 20 for t in (c.get("tags") or [])) + 46 + 22
+        ops = c.get("operators") or []
+        ops_n = len(ops)
+        distinct_r = len({int(o.get("rarity") or 4) for o in ops})
+        ops_w = ops_n * 64 + max(0, distinct_r - 1) * 16 + 22
+        tags_w = sum(len(t) * 12 + 20 for t in (c.get("tags") or [])) + 48 + 22
         return max(ops_w, tags_w)
 
-    # 紧凑小组合（≤8人）放上方做 First-Fit 行装箱，大组合（>8人）统一放下方占满整行，彻底消除右侧空洞
-    compact_combos = [c for c in combos if len(c.get("operators") or []) <= 8]
-    wide_combos = [c for c in combos if len(c.get("operators") or []) > 8]
-
-    packed_rows: list[list[tuple[dict[str, Any], int]]] = []
-    for c in compact_combos:
-        w_need = _est_box_w(c)
-        placed = False
-        for row in packed_rows:
-            used = sum(w for _, w in row) + 10 * len(row)
-            if used + w_need <= inner_w:
-                row.append((c, w_need))
-                placed = True
-                break
-        if not placed:
-            packed_rows.append([(c, w_need)])
+    # 按保底星级档位分组（6★+ > 5★+ > 1★车 > 4★+），确保高星大组合绝不掉到低星下方；同档位内做紧凑行装箱
+    tier_order: list[int] = []
+    tier_buckets: dict[int, list[dict[str, Any]]] = {}
+    for c in combos:
+        sc = int(c.get("score") or 40)
+        if sc not in tier_buckets:
+            tier_order.append(sc)
+            tier_buckets[sc] = []
+        tier_buckets[sc].append(c)
 
     row_htmls: list[str] = []
     est_rows = 0
-    for row in packed_rows:
-        boxes_str = "".join(_render_combo_box(c, False, grow=max(1, w // 40)) for c, w in row)
-        row_htmls.append(f"<div class='rr'>{boxes_str}</div>")
-        est_rows += 1
-    for c in wide_combos:
-        ops_n = len(c.get("operators") or [])
-        row_htmls.append(_render_combo_box(c, True))
-        est_rows += 1 + (ops_n + per_row - 1) // per_row
+    for sc in tier_order:
+        group = tier_buckets[sc]
+        compact_combos = [c for c in group if len(c.get("operators") or []) <= 8]
+        wide_combos = [c for c in group if len(c.get("operators") or []) > 8]
+
+        packed_rows: list[list[tuple[dict[str, Any], int]]] = []
+        for c in compact_combos:
+            w_need = _est_box_w(c)
+            placed = False
+            for row in packed_rows:
+                used = sum(w for _, w in row) + 10 * len(row)
+                if used + w_need <= inner_w:
+                    row.append((c, w_need))
+                    placed = True
+                    break
+            if not placed:
+                packed_rows.append([(c, w_need)])
+
+        for row in packed_rows:
+            boxes_str = "".join(_render_combo_box(c, False, grow=max(1, w // 40)) for c, w in row)
+            row_htmls.append(f"<div class='rr'>{boxes_str}</div>")
+            est_rows += 1
+        for c in wide_combos:
+            ops_n = len(c.get("operators") or [])
+            row_htmls.append(_render_combo_box(c, True))
+            est_rows += 1 + (ops_n + per_row - 1) // per_row
 
     body = hdr + "<div class='bd'><div class='rg'>" + "".join(row_htmls) + "</div></div>"
     est_h = max(360, 190 + est_rows * 145)
