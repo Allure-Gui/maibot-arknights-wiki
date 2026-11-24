@@ -437,61 +437,26 @@ async def build_recruit_card_html(
         else:
             content_html = f"<div class='rl'>{''.join(_render_op(o) for o in ops)}</div>"
 
-        style = f"--rc:{rc}" if is_wide else (f"--rc:{rc};flex:{grow} 1 0%" if grow > 0 else f"--rc:{rc};flex:0 1 auto")
         return (
-            f"<div class='rb{' wide' if is_wide else ''}' style='{style}'>"
+            f"<div class='rb{' wide' if is_wide else ''}' style='--rc:{rc}'>"
             f"<div class='rh'>{tag_html}</div>"
             f"{content_html}</div>"
         )
 
-    def _est_box_w(c: dict[str, Any]) -> int:
-        ops = c.get("operators") or []
-        ops_n = len(ops)
-        distinct_r = len({int(o.get("rarity") or 4) for o in ops})
-        sub_extra = (distinct_r * 20 + max(0, distinct_r - 1) * 10) if distinct_r > 1 else 0
-        ops_w = ops_n * 64 + sub_extra + 26
-        tags_w = sum(len(t) * 12 + 22 for t in (c.get("tags") or [])) + 26
-        return max(ops_w, tags_w)
-
-    # 保持 6★ > 5★ > 4★ > 1★ 严格先后顺序，按流式顺序装箱：
-    # - 大组合（>8人）独占整行；
-    # - 连续小组合（≤8人）自动从左到右同行紧凑拼排（不再因 5★/4★ 交界把单个 5★ 孤立撑满整行）；
-    # - 若某行最终仅剩 1 个较窄的小组合，则按内容自然宽度收紧，避免出现 1 人霸占整行黑洞。
-    row_htmls: list[str] = []
+    # 保持 6★ > 5★ > 4★ > 1★ 严格顺序：小组合紧贴内容自然宽度流式紧密排布（零框内黑洞），大组合（>8人）独占整行
+    box_htmls: list[str] = []
     est_rows = 0
-    cur_row: list[tuple[dict[str, Any], int]] = []
-
-    def _flush_row() -> None:
-        nonlocal est_rows
-        if not cur_row:
-            return
-        if len(cur_row) == 1:
-            c0, w0 = cur_row[0]
-            # 单箱宽度超过容器 62% 时舒展铺满，否则按内容自然宽度收紧不拖长尾巴
-            grow0 = max(1, w0 // 40) if w0 >= int(inner_w * 0.62) else 0
-            row_htmls.append(f"<div class='rr'>{_render_combo_box(c0, False, grow=grow0)}</div>")
-        else:
-            boxes_str = "".join(_render_combo_box(c, False, grow=max(1, w // 40)) for c, w in cur_row)
-            row_htmls.append(f"<div class='rr'>{boxes_str}</div>")
-        est_rows += 1
-        cur_row.clear()
-
     for c in combos:
         ops_n = len(c.get("operators") or [])
-        if ops_n > 8:
-            _flush_row()
-            row_htmls.append(_render_combo_box(c, True))
+        is_wide = ops_n > 8
+        box_htmls.append(_render_combo_box(c, is_wide))
+        if is_wide:
             est_rows += 1 + (ops_n + per_row - 1) // per_row
-            continue
-        w_need = _est_box_w(c)
-        used = sum(w for _, w in cur_row) + 10 * len(cur_row)
-        if cur_row and used + w_need > inner_w:
-            _flush_row()
-        cur_row.append((c, w_need))
-    _flush_row()
+        else:
+            est_rows += 1
 
-    body = hdr + "<div class='bd'><div class='rg'>" + "".join(row_htmls) + "</div></div>"
-    est_h = max(360, 190 + est_rows * 145)
+    body = hdr + "<div class='bd'><div class='rg'>" + "".join(box_htmls) + "</div></div>"
+    est_h = max(360, 190 + est_rows * 140)
     return _doc("公开招募组合", body, ac, soft, width, "".join(css_rules)), width, est_h, complete
 
 
