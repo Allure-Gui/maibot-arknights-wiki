@@ -384,10 +384,11 @@ def _send_ok(res: Any) -> bool:
     return False
 
 
-_RE_RECRUIT_COMMAND = re.compile(r"^/(?:公招|公开招募|recruit)(?:\s+(?P<args>.*))?$", re.I | re.S)
-_RE_WIKI_COMMAND = re.compile(r"^/(?:方舟|prts|ark)(?:\s+(?P<args>.*))?$", re.I | re.S)
-_RE_ILLUSTRATION_COMMAND = re.compile(r"^/(?:立绘|方舟立绘|ak图)(?:\s+(?P<args>.*))?$", re.I | re.S)
-_RE_MSG_PLACEHOLDER = re.compile(r"\[(?:图片|图|表情|回复|引用|CQ:[^\]]+)[^\]]*\]", re.I | re.S)
+_LEAD_PH = r"(?:\s*\[(?:图片|图|表情|回复|引用|CQ:[^\]]+)(?:[^\[\]]|\[[^\[\]]*\])*\])*\s*"
+_RE_RECRUIT_COMMAND = re.compile(rf"^{_LEAD_PH}/(?:公招|公开招募|recruit)(?:\s+(?P<args>.*))?$", re.I | re.S)
+_RE_WIKI_COMMAND = re.compile(rf"^{_LEAD_PH}/(?:方舟|prts|ark)(?:\s+(?P<args>.*))?$", re.I | re.S)
+_RE_ILLUSTRATION_COMMAND = re.compile(rf"^{_LEAD_PH}/(?:立绘|方舟立绘|ak图)(?:\s+(?P<args>.*))?$", re.I | re.S)
+_RE_MSG_PLACEHOLDER = re.compile(r"\[(?:图片|图|表情|回复|引用|CQ:[^\]]+)(?:[^\[\]]|\[[^\[\]]*\])*\]", re.I | re.S)
 
 
 def _command_args(kwargs: dict[str, Any], pattern: re.Pattern[str]) -> str:
@@ -1499,10 +1500,12 @@ class ArknightsWikiPlugin(MaiBotPlugin):
 
         def _norm_img(val: Any) -> str:
             if isinstance(val, dict):
-                for k in ("base64", "image_base64", "b64", "url", "file", "data"):
+                for k in ("binary_data_base64", "base64", "image_base64", "b64", "url", "file", "data"):
                     v = val.get(k)
                     if isinstance(v, str) and v.strip():
-                        return _norm_img(v)
+                        res = _norm_img(v)
+                        if res:
+                            return res
                 return ""
             if not isinstance(val, str):
                 return ""
@@ -1523,10 +1526,15 @@ class ArknightsWikiPlugin(MaiBotPlugin):
                 st = str(segs.get("type") or "").lower()
                 data = segs.get("data")
                 if st in ("image", "img", "photo") and not image_ref:
-                    image_ref = _norm_img(data)
+                    image_ref = _norm_img(segs.get("binary_data_base64")) or _norm_img(data) or _norm_img(segs)
                 elif st == "reply" and not reply_id:
                     if isinstance(data, dict):
-                        reply_id = str(data.get("id") or data.get("message_id") or "").strip()
+                        reply_id = str(
+                            data.get("target_message_id")
+                            or data.get("id")
+                            or data.get("message_id")
+                            or ""
+                        ).strip()
                     elif data is not None:
                         reply_id = str(data).strip()
                 elif st == "seglist" and isinstance(data, list):
@@ -1537,12 +1545,22 @@ class ArknightsWikiPlugin(MaiBotPlugin):
             elif hasattr(segs, "type") and hasattr(segs, "data"):
                 _walk_segs({"type": getattr(segs, "type", ""), "data": getattr(segs, "data", None)})
 
+        # 兼容 capability.message.get_by_id 返回的 {"success": True, "message": {...}} 包装层
+        if isinstance(msg, dict) and isinstance(msg.get("message"), dict):
+            msg = msg["message"]
+
         if isinstance(msg, dict):
             for key in ("message_segments", "raw_message", "segments", "seg_list"):
                 if msg.get(key):
                     _walk_segs(msg.get(key))
             if not reply_id:
-                reply_id = str(msg.get("reply_to") or msg.get("reply_id") or msg.get("reply_message_id") or "").strip()
+                reply_id = str(
+                    msg.get("reply_to")
+                    or msg.get("reply_id")
+                    or msg.get("reply_message_id")
+                    or msg.get("target_message_id")
+                    or ""
+                ).strip()
             if not image_ref:
                 for key in ("image_base64", "image_url", "image"):
                     if msg.get(key):
@@ -1590,7 +1608,8 @@ class ArknightsWikiPlugin(MaiBotPlugin):
         # 3) 同用户 60 秒内刚发的图片（兼容「先发图、紧接着发 /公招」的顺手操作）
         if hasattr(msg_cap, "get_recent") and hasattr(msg_cap, "get_by_id"):
             try:
-                recent = await msg_cap.get_recent(stream_id, limit=5)
+                recent_raw = await msg_cap.get_recent(stream_id, limit=5)
+                recent = recent_raw.get("messages") if isinstance(recent_raw, dict) else recent_raw
                 now = time.time()
                 if isinstance(recent, list):
                     for item in reversed(recent):
