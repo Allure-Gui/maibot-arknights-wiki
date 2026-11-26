@@ -64,7 +64,7 @@ class PluginSection(PluginConfigBase):
         description="是否启用明日方舟wiki插件",
         json_schema_extra={"label": "启用插件"},
     )
-    config_version: str = Field(default="0.3.1", description="配置版本")
+    config_version: str = Field(default="0.3.2", description="配置版本")
 
 
 _LIST_MODE_MAP = {
@@ -213,7 +213,7 @@ class PRTSSection(PluginConfigBase):
         json_schema_extra={"label": "API 地址"},
     )
     user_agent: str = Field(
-        default="MaiBot-ArknightsWiki/0.3.1 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
+        default="MaiBot-ArknightsWiki/0.3.2 (+https://github.com/Allure-Gui/maibot-arknights-wiki)",
         description="礼貌 User-Agent（遵循 MediaWiki API 规范）",
         json_schema_extra={"label": "User-Agent"},
     )

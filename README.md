@@ -4,7 +4,7 @@
   <p>适用于 <b>MaiBot（麦麦）</b> 的《明日方舟》PRTS Wiki 查询与群聊工具插件：低延迟黑话语境感知、2x 黑曜石金箔战术卡片、公开招募半身像计算与截图识图、当期寻访/活动海报、高清立绘直发与定时到期提醒。</p>
 
   <p>
-    <img src="https://img.shields.io/badge/Version-v0.3.1-C9A25B?style=for-the-badge&labelColor=171B24" alt="Version v0.3.1" />
+    <img src="https://img.shields.io/badge/Version-v0.3.2-C9A25B?style=for-the-badge&labelColor=171B24" alt="Version v0.3.2" />
     <img src="https://img.shields.io/badge/MaiCore-1.4.6+-4FA374?style=for-the-badge&labelColor=171B24" alt="MaiCore 1.4.6+" />
     <img src="https://img.shields.io/badge/Data-PRTS%20Wiki-3B7DD8?style=for-the-badge&labelColor=171B24" alt="PRTS Wiki" />
     <img src="https://img.shields.io/badge/License-MIT-E8B44C?style=for-the-badge&labelColor=171B24" alt="MIT License" />
