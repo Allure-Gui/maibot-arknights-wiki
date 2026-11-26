@@ -1,9 +1,32 @@
-# 明日方舟wiki插件
+<div align="center">
+  <img src="https://fastly.jsdelivr.net/gh/Allure-Gui/maibot-arknights-wiki@main/assets/icon.png" width="76" alt="明日方舟wiki插件图标" />
+  <h1>明日方舟wiki插件</h1>
+  <p>适用于 <b>MaiBot（麦麦）</b> 的《明日方舟》PRTS Wiki 查询与群聊工具插件：低延迟黑话语境感知、2x 黑曜石金箔战术卡片、公开招募半身像计算与截图识图、当期寻访/活动海报、高清立绘直发与定时到期提醒。</p>
 
-适用于 **MaiBot（麦麦）** 的《明日方舟》PRTS Wiki 查询与群聊工具插件。提供低延迟黑话语境感知、干员与 BOSS 战术卡片图、公开招募半身像计算与截图识图、当期寻访/活动官方海报图、高清立绘直发以及可选的活动到期定时提醒。
+  <p>
+    <img src="https://img.shields.io/badge/Version-v0.3.1-C9A25B?style=for-the-badge&labelColor=171B24" alt="Version v0.3.1" />
+    <img src="https://img.shields.io/badge/MaiCore-1.4.6+-4FA374?style=for-the-badge&labelColor=171B24" alt="MaiCore 1.4.6+" />
+    <img src="https://img.shields.io/badge/Data-PRTS%20Wiki-3B7DD8?style=for-the-badge&labelColor=171B24" alt="PRTS Wiki" />
+    <img src="https://img.shields.io/badge/License-MIT-E8B44C?style=for-the-badge&labelColor=171B24" alt="MIT License" />
+  </p>
+
+  <p>
+    <a href="https://github.com/Allure-Gui/maibot-arknights-wiki/releases">发行版下载</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/Allure-Gui/maibot-arknights-wiki/blob/main/CHANGELOG.md">更新日志</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/Allure-Gui/maibot-arknights-wiki/blob/main/config.example.toml">配置样例</a>
+    &nbsp;·&nbsp;
+    <a href="https://github.com/Allure-Gui/maibot-arknights-wiki/issues">问题反馈</a>
+  </p>
+</div>
 
 <p align="center">
-  <img src="assets/help-preview.png" alt="明日方舟wiki插件 · 指令手册" width="680" />
+  <a href="https://fastly.jsdelivr.net/gh/Allure-Gui/maibot-arknights-wiki@main/assets/help-preview.png">
+    <img src="https://fastly.jsdelivr.net/gh/Allure-Gui/maibot-arknights-wiki@main/assets/help-preview.png" alt="明日方舟wiki插件 · 指令手册" width="680" />
+  </a>
+  <br>
+  <sub>点击图片可查看大图</sub>
 </p>
 
 ---
@@ -52,7 +75,7 @@
 
 1. **市场安装（推荐）**：在麦麦插件市场搜索「明日方舟wiki插件」并安装对应兼容版本。
 2. **手动安装**：从 [GitHub Releases](https://github.com/Allure-Gui/maibot-arknights-wiki/releases) 下载对应标签的源码包，解压至 MaiBot 的 `plugins/arknights_wiki/`，确保 `_manifest.json` 与 `plugin.py` 位于该目录根部。
-3. **主要配置项**（完整示例见 [`config.example.toml`](./config.example.toml)，已在 MaiBot `1.4.6`、`1.4.8` 与 Plugin SDK `2.23.0` 上完成离线回归）：
+3. **主要配置项**（完整示例见 [`config.example.toml`](https://github.com/Allure-Gui/maibot-arknights-wiki/blob/main/config.example.toml)，已在 MaiBot `1.4.6`、`1.4.8` 与 Plugin SDK `2.23.0` 上完成离线回归）：
    - **生效范围与黑白名单**（`[scope]`）：控制群聊/私聊开关及「不限制 / 仅白名单 / 排除黑名单」。
    - **活动到期提醒**（`[reminder]`）：默认关闭，可按需开启并设置每日提醒小时（默认 `9`）、提前提醒时长（默认 `24` 小时）及是否包含卡池。
    - **自定义黑话与昵称**（`[glossary]`）：按行填写 `外号=干员名` 即可优先覆盖内置词典。
@@ -62,6 +85,6 @@
 
 ## 开源协议与版权声明
 
-- **插件代码**：本仓库全部代码采用 [MIT License](./LICENSE) 开源，**不包含**任何游戏解包文件、立绘图片、Wiki 快照或预置数据库。
+- **插件代码**：本仓库全部代码采用 [MIT License](https://github.com/Allure-Gui/maibot-arknights-wiki/blob/main/LICENSE) 开源，**不包含**任何游戏解包文件、立绘图片、Wiki 快照或预置数据库。
 - **游戏版权**：《明日方舟》相关角色立绘、设定与文本版权归 **上海鹰角网络科技有限公司** 及其关联公司所有，本插件仅供爱好者学习与非商业交流使用。
 - **PRTS Wiki 署名**：实时查询并缓存在本地的 Wiki 数据来自 [PRTS Wiki](https://prts.wiki)，遵循 **CC BY-NC-SA 4.0（署名-非商业性使用-相同方式共享）** 协议，使用与分享时请保留来源署名并遵守非商业条款。
